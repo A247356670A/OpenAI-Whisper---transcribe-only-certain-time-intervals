@@ -1,0 +1,9 @@
+# Default ignored files
+/shelf/
+/workspace.xml
+
+# 禁止视频文件
+*.mp4
+
+# 禁止字幕文件
+*.srt
