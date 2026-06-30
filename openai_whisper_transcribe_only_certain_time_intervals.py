@@ -44,6 +44,8 @@ audio_file_path = "20260623_ドラキナちゃん最高！！目移りが止ま�
 
 srt_file = "20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_LLM_zh.srt"
 
+output_srt = "20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_partB.srt"
+
 print("Using audio file:", audio_file_path)
 
 """# Load audio using librosa
@@ -138,4 +140,4 @@ Note: you do not need to do the first two transcriptions for this to work
 """
 
 # transcribe each audio segment without the exclusions
-transcribe_segments(audio_segments, other_whisper_options, model)
+transcribe_segments(audio_segments, other_whisper_options, model, output_srt)

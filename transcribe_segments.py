@@ -1,9 +1,32 @@
-def transcribe_segments(audio_segments, other_whisper_options, model):
+def seconds_to_srt_time(seconds):
+    """
+    秒 -> SRT时间格式
+    例如：
+    123.456
+    ->
+    00:02:03,456
+    """
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    milliseconds = int(round((seconds - int(seconds)) * 1000))
+
+    # 防止毫秒四舍五入到1000
+    if milliseconds == 1000:
+        milliseconds = 0
+        secs += 1
+
+    return f"{hours:02}:{minutes:02}:{secs:02},{milliseconds:03}"
+
+
+def transcribe_segments(audio_segments, other_whisper_options, model, output_srt):
     '''
     Transcribes only the passed audio segments
     and offsets the transcription segments start and end times
 
     '''
+
+    subtitles = []
 
     # transcribe each audio segment
     for i, audio_segment in enumerate(audio_segments):
@@ -39,7 +62,33 @@ def transcribe_segments(audio_segments, other_whisper_options, model):
                 if transcript_segment['start'] < audio_segment[0]:
                     transcript_segment['start'] = audio_segment[0]
 
+                subtitles.append({
+                    "start": transcript_segment["start"],
+                    "end": transcript_segment["end"],
+                    "text": transcript_segment["text"].strip()
+                })
                 print(transcript_segment['start'], ' --> ',
                       transcript_segment['end'], '\n', transcript_segment['text'])
 
         print("\n")
+
+    # ==========================
+    # 写 SRT
+    # ==========================
+
+    subtitles.sort(key=lambda x: x["start"])
+
+    with open(output_srt, "w", encoding="utf-8") as f:
+
+        for idx, sub in enumerate(subtitles, start=1):
+
+            f.write(f"{idx}\n")
+
+            f.write(
+                f"{seconds_to_srt_time(sub['start'])} --> "
+                f"{seconds_to_srt_time(sub['end'])}\n"
+            )
+
+            f.write(sub["text"] + "\n\n")
+
+    print(f"SRT saved to: {output_srt}")
