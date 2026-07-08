@@ -90,12 +90,12 @@ def extract_time_intervals(srt_file, merge_gap=1.0):
 # ==========================
 # Example
 # ==========================
-
-srt_file = "20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_LLM_zh.srt"
-
-time_intervals = extract_time_intervals(
-    srt_file,
-    merge_gap=1.0
-)
-
-print(time_intervals)
+#
+# srt_file = "20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_LLM_zh.srt"
+#
+# time_intervals = extract_time_intervals(
+#     srt_file,
+#     merge_gap=1.0
+# )
+#
+# print(time_intervals)
