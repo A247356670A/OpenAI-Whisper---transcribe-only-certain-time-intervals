@@ -1,22 +1,3 @@
-# -*- coding: utf-8 -*-
-"""OpenAI Whisper - transcribe only certain time intervals.ipynb
-Original file is located at
-    https://colab.research.google.com/drive/17cTsmfVJmpDDMURGcu8hUu1zHNAYbfa5
-
-# OpenAI Whisper with time intervals
-
-This allows you to make transcriptions on certain time intervals or even exclude certain time intervals from the transcriptions by getting the audio as an array and filtering stuff out before passing it to whisper.
-
-Written by [Octavian Mot](https://github.com/octimot/)
-
-!apt install ffmpeg
-
-pip install git+https://github.com/openai/whisper.git
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-pip install ffmpeg-python
-pip install librosa
-!nvidia-smi 
-"""
 from SrtMerge import merge_srt, write_srt
 from SrtToIntervals import extract_time_intervals
 from exclude_segments_by_intervals import exclude_segments_by_intervals
@@ -31,12 +12,6 @@ import librosa
 torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = whisper.load_model("large-v2")
 
-first_whisper_options = {
-    "language": "Japanese",
-    "word_timestamps": True,
-    "suppress_tokens": [],
-    "condition_on_previous_text": True,
-}
 # define whisper options:
 second_whisper_options = {
     "language": "Japanese",
@@ -68,28 +43,20 @@ audio_array, sr = librosa.load(file_path, sr=16_000)
 # there's just one audio segment, which is the full audio array
 audio_segments = audio_array
 
-"""
-Step 1
-
-Transcribe full file with Whisper
-
-Just to see all the transcriptions segments as you'd expect from a normal Whisper transcription, and then use them for visual comparison.
-"""
-
-# transcribe the first whisper
-transcribe(file_path, first_whisper_options, model, first_srt_file)
 
 """
+Do not transcribe certain segments (transcription 3)
 
-Step 2 
+#### First, define which time intervals you absolutely don't want to transcribe
 
-Do not transcribe certain segments
-
-
+Note: you do not need to do any of the previous transcriptions for this to work.
 """
 
 # you can either use the full audio file ...
 time_intervals = [[0, len(audio_array) / sr]]
+
+# ... or time intervals as above
+# time_intervals =  [[1, 6], [19, 27], [30, 32], [40.6, 53.12], [54, 60]]
 
 print('Selected intervals for transcription:\n ', time_intervals)
 
@@ -114,8 +81,7 @@ audio_segments, time_intervals = \
 print('time intervals:\n {} \n'.format(time_intervals))
 print('audio segments:\n ', audio_segments)
 
-"""
-Now transcribe only the segments that haven't been excluded
+"""#### Now transcribe only the segments that haven't been excluded
 Note: you do not need to do the first two transcriptions for this to work
 """
 
@@ -132,10 +98,8 @@ write_srt(merged, merged_srt)
 
 print("合并 + 去重完成:", merged_srt)
 
-"""
-Only transcribe certain segments (transcription 2)
-
-But, first define which using their start and end times
+"""# Only transcribe certain segments (transcription 2)
+#### But, first define which using their start and end times
 """
 
 # which time intervals do we want to transcribe?
