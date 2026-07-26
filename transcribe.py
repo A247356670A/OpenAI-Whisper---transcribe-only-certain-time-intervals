@@ -110,6 +110,13 @@ def transcribe_segments(audio_segments,
 
         for i, audio_segment in enumerate(audio_segments):
 
+            duration = audio_segment[1] - audio_segment[0]
+
+            if duration < 0.5:
+                print(
+                    f"Skip segment {i}, duration={duration:.3f}s"
+                )
+                continue
             print(
                 f"Segment {i} - second "
                 f"{audio_segment[0]} to {audio_segment[1]}"

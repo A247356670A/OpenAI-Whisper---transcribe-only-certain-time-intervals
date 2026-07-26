@@ -5,10 +5,15 @@ def split_audio_by_intervals(audio_array, time_intervals=None, sr=16_000):
     together with the time_intervals passed to the function
 
     '''
+    MIN_DURATION = 0.5  # 秒
 
     # sort the audio segments by start time
     time_intervals = sorted(time_intervals, key=lambda x:x[0])
-
+    time_intervals = [
+        interval
+        for interval in time_intervals
+        if interval[1] - interval[0] >= MIN_DURATION
+    ]
     # reset the audio segments list
     audio_segments = []
 
