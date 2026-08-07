@@ -1,170 +1,40 @@
-# -*- coding: utf-8 -*-
-"""OpenAI Whisper - transcribe only certain time intervals.ipynb
-Original file is located at
-    https://colab.research.google.com/drive/17cTsmfVJmpDDMURGcu8hUu1zHNAYbfa5
+"""Start the subtitle GUI, or run the same two-pass workflow from a terminal.
 
-# OpenAI Whisper with time intervals
-
-This allows you to make transcriptions on certain time intervals or even exclude certain time intervals from the transcriptions by getting the audio as an array and filtering stuff out before passing it to whisper.
-
-Written by [Octavian Mot](https://github.com/octimot/)
-
-!apt install ffmpeg
-
-pip install git+https://github.com/openai/whisper.git
-pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-pip install ffmpeg-python
-pip install librosa
-!nvidia-smi 
-"""
-from SrtMerge import merge_srt, write_srt
-from SrtToIntervals import extract_time_intervals
-from exclude_segments_by_intervals import exclude_segments_by_intervals
-from split_audio_by_intervals import split_audio_by_intervals
-from transcribe import transcribe_segments, transcribe
-
-import torch
-import whisper
-import librosa
-
-# load whisper model
-torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = whisper.load_model("large-v2")
-
-first_whisper_options = {
-    "language": "Japanese",
-    "word_timestamps": True,
-    "suppress_tokens": [],
-    "condition_on_previous_text": True,
-}
-# define whisper options:
-second_whisper_options = {
-    "language": "Japanese",
-    "word_timestamps": True,
-    "suppress_tokens": [],
-    "condition_on_previous_text": False,
-}
-task = 'transcribe'
-name = "20260806_【ゼンレスゾーンゼロ】波乱万丈Ver.3.1メインストーリー「ロング・グッドバイ」前半戦【Vtuber】"
-# upload the files
-file_path = "/Users/junxianchen/四月一日/" + name + ".mp4"
-
-# srt file from fist whisper
-first_srt_file = name + ".srt"
-
-# srt file from second whisper
-second_srt_file = name + "_partB.srt"
-
-print("Using file: ", file_path)
-print("first srt path: ", first_srt_file)
-print("second srt path: ", second_srt_file)
-
-"""
-Load audio using librosa
-
-We're using librosa to load the audio as an array.
-This is not necessary for the default Whisper pipeline, but we'll need it later to split the audio into the segments we want.
+Double-clicking this file (or running it without arguments) opens the GUI.
 """
 
-# load audio file using librosa and get the audio_array
-audio_array, sr = librosa.load(file_path, sr=16_000)
-# there's just one audio segment, which is the full audio array
-audio_segments = audio_array
+from __future__ import annotations
 
-"""
-Step 1
+import argparse
+from pathlib import Path
 
-Transcribe full file with Whisper
+from subtitle_pipeline import run_two_pass_transcription
 
-Just to see all the transcriptions segments as you'd expect from a normal Whisper transcription, and then use them for visual comparison.
-"""
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="用 Whisper 生成日语字幕 A、B 和合并字幕。"
+    )
+    parser.add_argument("video", nargs="?", help="视频或音频文件；省略时启动图形界面")
+    parser.add_argument("--output-dir", help="字幕保存文件夹，默认与视频相同")
+    parser.add_argument("--model", default="large-v2", help="Whisper 模型，默认 large-v2")
+    parser.add_argument("--merge-gap", type=float, default=1.0, help="A 字幕间的合并间隔（秒）")
+    parser.add_argument("--duplicate-threshold", type=float, default=0.5, help="合并去重阈值（秒）")
+    args = parser.parse_args()
 
-# transcribe the first whisper
-transcribe(file_path, first_whisper_options, model, first_srt_file)
+    if not args.video:
+        from subtitle_gui import main as gui_main
+        gui_main()
+        return
 
-"""
-
-Step 2 
-
-Do not transcribe certain segments
-
-
-"""
-
-# you can either use the full audio file ...
-time_intervals = [[0, len(audio_array) / sr]]
-
-print('Selected intervals for transcription:\n ', time_intervals)
-
-# which time segments we do NOT want to transcribe?
-# format is same as above:
-#  [[segment1_start_time, segment1_end_time], [segment2_start_time, segment2_end_time], etc.]
-# these times can be in an unordered fashion, as they will be sorted later
+    outputs = run_two_pass_transcription(
+        args.video,
+        args.output_dir or Path(args.video).parent,
+        model_name=args.model,
+        merge_gap=args.merge_gap,
+        duplicate_threshold=args.duplicate_threshold,
+    )
+    print(f"\n完成，合并字幕：{outputs.merged}")
 
 
-excluded_time_intervals = extract_time_intervals(
-    first_srt_file,
-    merge_gap=1.0
-)
-
-# call the exclude function to filter out the unwanted audio segments
-audio_segments, time_intervals = \
-    exclude_segments_by_intervals(audio_array,
-                                  time_intervals,
-                                  excluded_time_intervals,
-                                  sr)
-
-print('time intervals:\n {} \n'.format(time_intervals))
-print('audio segments:\n ', audio_segments)
-
-"""
-Now transcribe only the segments that haven't been excluded
-Note: you do not need to do the first two transcriptions for this to work
-"""
-
-# transcribe each audio segment without the exclusions
-transcribe_segments(audio_segments, second_whisper_options, model, second_srt_file)
-
-merged = merge_srt(first_srt_file, second_srt_file, time_threshold=0.5)
-
-merged_srt = first_srt_file.replace(
-    ".srt",
-    "_merged.srt"
-)
-write_srt(merged, merged_srt)
-
-print("合并 + 去重完成:", merged_srt)
-
-"""
-Only transcribe certain segments (transcription 2)
-
-But, first define which using their start and end times
-"""
-
-# which time intervals do we want to transcribe?
-# anything in the audio not within these intervals will be ignored
-# format is
-# [
-#    [segment1_start_time, segment1_end_time],
-#    [segment2_start_time, segment2_end_time],
-#    etc.
-# ]
-# these times can be placed in an unordered fashion,
-# as they will be sorted later
-# time_intervals = [[54, 60], [19, 27], [40.600, 53.120]]
-
-# print('Selected intervals for transcription:\n {} \n'.format(time_intervals))
-
-# call split function
-# audio_segments, time_intervals = \
-# split_audio_by_intervals(audio_array, time_intervals, sr)
-
-# print('time intervals:\n {} \n'.format(time_intervals))
-# print('audio segments:\n {} \n'.format(audio_segments))
-
-"""#### Now transcribe only those segments
-
-Note: for this to work you do not need to do the first transcription.
-"""
-
-# transcribe_segments(audio_segments, other_whisper_options)
+if __name__ == "__main__":
+    main()
