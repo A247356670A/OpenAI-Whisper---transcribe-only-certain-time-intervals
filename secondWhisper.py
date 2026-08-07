@@ -21,13 +21,13 @@ second_whisper_options = {
 }
 task = 'transcribe'
 # upload the files
-file_path = "/Users/junxianchen/四月一日/20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】.mp4"
+file_path = "/Users/junxianchen/四月一日/20260622_シーズン3きたああ！！初めてのロスカリファ！！！第1章「ある夢に遊ぶ者の告白」前半戦【Vtuber】.mp4"
 
 # srt file from fist whisper
-first_srt_file = "20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】.srt"
+first_srt_file = "20260622_シーズン3きたああ！！初めてのロスカリファ！！！第1章「ある夢に遊ぶ者の告白」前半戦【Vtuber】.srt"
 
 # srt file from second whisper
-second_srt_file = "20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】_partB.srt"
+second_srt_file = "20260622_シーズン3きたああ！！初めてのロスカリファ！！！第1章「ある夢に遊ぶ者の告白」前半戦【Vtuber】_partB.srt"
 
 print("Using file: ", file_path)
 

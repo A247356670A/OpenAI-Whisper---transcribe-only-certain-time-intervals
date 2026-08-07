@@ -46,13 +46,13 @@ second_whisper_options = {
 }
 task = 'transcribe'
 # upload the files
-file_path = "/Users/junxianchen/四月一日/20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】.mp4"
+file_path = "/Users/junxianchen/四月一日/20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】.mp4"
 
 # srt file from fist whisper
-first_srt_file = "20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】.srt"
+first_srt_file = "20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】.srt"
 
 # srt file from second whisper
-second_srt_file = "20260725_HoYoFair同時視聴！ビデオ屋の2周年をみなさまとお祝いっ！！ _ ミラーあり【Vtuber】_partB.srt"
+second_srt_file = "20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】_partB.srt"
 
 print("Using file: ", file_path)
 
