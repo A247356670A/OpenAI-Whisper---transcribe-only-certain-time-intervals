@@ -45,16 +45,19 @@ second_whisper_options = {
     "condition_on_previous_text": False,
 }
 task = 'transcribe'
+name = "20260806_【ゼンレスゾーンゼロ】波乱万丈Ver.3.1メインストーリー「ロング・グッドバイ」前半戦【Vtuber】"
 # upload the files
-file_path = "/Users/junxianchen/四月一日/20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】.mp4"
+file_path = "/Users/junxianchen/四月一日/" + name + ".mp4"
 
 # srt file from fist whisper
-first_srt_file = "20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】.srt"
+first_srt_file = name + ".srt"
 
 # srt file from second whisper
-second_srt_file = "20260804_【ゼンレスゾーンゼロ】レミエールの動画が山ほど来てるぞ！！今夜は観賞パーティですわ！！【Vtuber】_partB.srt"
+second_srt_file = name + "_partB.srt"
 
 print("Using file: ", file_path)
+print("first srt path: ", first_srt_file)
+print("second srt path: ", second_srt_file)
 
 """
 Load audio using librosa
