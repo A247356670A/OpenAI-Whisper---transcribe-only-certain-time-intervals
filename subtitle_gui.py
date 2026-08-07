@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import os
 from pathlib import Path
 from queue import Empty, Queue
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 
 from subtitle_pipeline import build_output_paths, run_two_pass_transcription
@@ -24,6 +26,25 @@ VIDEO_FILE_TYPES = [
     ("视频或音频", "*.mp4 *.mkv *.avi *.mov *.webm *.m4v *.mp3 *.wav *.flac *.m4a"),
     ("所有文件", "*.*"),
 ]
+
+
+def enable_high_dpi_awareness() -> None:
+    """Ask Windows to render the Tk window at the monitor's native DPI."""
+    if not sys.platform.startswith("win"):
+        return
+    try:
+        # Windows 10 1703+: Per-monitor V2 gives the sharpest result when a
+        # window is moved between displays using different scale factors.
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except (AttributeError, OSError):
+        try:
+            # Compatible fallback for older Windows releases.
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except (AttributeError, OSError):
+                pass
 
 
 class _QueueWriter:
@@ -69,7 +90,30 @@ class SubtitleApp:
             style.theme_use("vista")
         except tk.TclError:
             pass
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 18, "bold"))
+        # Tk's default font can look soft on scaled Windows displays.  Use the
+        # ClearType-aware UI font consistently for labels, buttons and inputs.
+        for font_name in (
+            "TkDefaultFont",
+            "TkTextFont",
+            "TkMenuFont",
+            "TkHeadingFont",
+            "TkCaptionFont",
+            "TkSmallCaptionFont",
+        ):
+            try:
+                tkfont.nametofont(font_name).configure(
+                    family="Microsoft YaHei UI", size=22
+                )
+            except tk.TclError:
+                pass
+        try:
+            tkfont.nametofont("TkFixedFont").configure(
+                family="Consolas", size=22
+            )
+        except tk.TclError:
+            pass
+
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 31, "bold"))
         style.configure("Hint.TLabel", foreground="#5b6472")
         style.configure("Drop.TLabel", anchor="center", padding=22, relief="solid")
 
@@ -309,6 +353,7 @@ class SubtitleApp:
 
 
 def main() -> None:
+    enable_high_dpi_awareness()
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     SubtitleApp(root)
     root.mainloop()
