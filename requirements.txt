@@ -1,0 +1,7 @@
+# Whisper and audio processing
+openai-whisper
+librosa
+torch
+
+# Native file drag-and-drop support for the desktop window
+tkinterdnd2
