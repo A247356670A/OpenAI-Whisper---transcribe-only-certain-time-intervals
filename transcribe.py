@@ -1,3 +1,6 @@
+"""Whisper transcription helpers that convert model segments into SRT files."""
+
+
 def seconds_to_srt_time(seconds):
     """
     秒 -> SRT时间格式
@@ -20,6 +23,7 @@ def seconds_to_srt_time(seconds):
 
 
 def save_srt(subtitles, output_srt):
+    """Sort timestamped Whisper segments and write them as an UTF-8 SRT file."""
     subtitles.sort(key=lambda x: x["start"])
 
     with open(output_srt, "w", encoding="utf-8") as f:
@@ -37,11 +41,15 @@ def save_srt(subtitles, output_srt):
     return output_srt
 
 
-#
 def transcribe(file_path,
                first_whisper_options,
                model,
                first_srt_file):
+    """Run a full-file Whisper pass and save its segments as subtitle A."""
+    # ``task`` is part of Whisper's optional decoding settings; keep it out of
+    # ``**options`` to avoid passing the same keyword twice to model.transcribe.
+    options = dict(first_whisper_options)
+    task = options.pop("task", "transcribe")
     subtitles = []
 
     try:
@@ -50,9 +58,9 @@ def transcribe(file_path,
 
         result = model.transcribe(
             file_path,
-            task="transcribe",
+            task=task,
             verbose=True,
-            **first_whisper_options
+            **options
         )
 
         if "segments" in result and result["segments"]:
@@ -103,7 +111,11 @@ def transcribe_segments(audio_segments,
                         second_whisper_options,
                         model,
                         second_srt_file):
+    """Transcribe only uncovered audio slices and restore their source offsets."""
 
+    # B may use a different task/options from A, configured in the GUI.
+    options = dict(second_whisper_options)
+    task = options.pop("task", "transcribe")
     subtitles = []
 
     try:
@@ -124,9 +136,9 @@ def transcribe_segments(audio_segments,
 
             result = model.transcribe(
                 audio_segment[2],
-                task="transcribe",
+                task=task,
                 verbose=True,
-                **second_whisper_options
+                **options
             )
 
             if "segments" in result and result["segments"]:

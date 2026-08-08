@@ -4,11 +4,10 @@ Double-clicking this file (or running it without arguments) opens the GUI.
 """
 
 from __future__ import annotations
-
 import argparse
 from pathlib import Path
-
 from subtitle_pipeline import run_two_pass_transcription
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(

@@ -1,3 +1,5 @@
+"""Merge timestamped SRT entries and remove matching near-duplicates."""
+
 import re
 
 
@@ -102,17 +104,3 @@ def write_srt(subs, output_path):
             f.write(f"{i}\n")
             f.write(f"{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n")
             f.write(f"{text}\n\n")
-
-
-# =========================
-# 使用
-# =========================
-
-# old_srt = "/Users/junxianchen/四月一日/20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】.srt"
-# new_srt = "/Users/junxianchen/四月一日/20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_partB.srt"
-# output_srt = "/Users/junxianchen/四月一日/20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_merged.srt"
-
-# merged = merge_srt(old_srt, new_srt, time_threshold=0.5)
-# write_srt(merged, output_srt)
-#
-# print("合并 + 去重完成:", output_srt)

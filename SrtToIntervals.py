@@ -1,3 +1,5 @@
+"""Read subtitle timestamps and combine neighbouring covered intervals."""
+
 import re
 
 def srt_time_to_seconds(time_str):
@@ -85,17 +87,3 @@ def extract_time_intervals(srt_file, merge_gap=1.0):
 
     # 自动合并
     return merge_intervals(time_intervals, merge_gap)
-
-
-# ==========================
-# Example
-# ==========================
-#
-# srt_file = "20260623_ドラキナちゃん最高！！目移りが止まらない第1章「ある夢に遊ぶ者の告白」中編【Vtuber】_LLM_zh.srt"
-#
-# time_intervals = extract_time_intervals(
-#     srt_file,
-#     merge_gap=1.0
-# )
-#
-# print(time_intervals)

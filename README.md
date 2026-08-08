@@ -30,8 +30,24 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 识别会在后台进行，运行日志会显示在窗口下方，因此界面不会卡死。拖放功能由 `tkinterdnd2` 提供；该包已在 `requirements.txt` 中列出。
 
+### 仅生成字幕 A
+
+选择 GUI 中的“仅生成字幕 A”模式并提供原视频。程序只执行完整视频的第一轮日语识别，输出 `视频名_A.srt`，不会生成 B 或合并字幕。
+
+### Whisper 高级参数
+
+点击 GUI 中的“第一/二轮 Whisper 高级参数…”，可分别编辑 A 和 B 的识别配置。窗口会为每个参数显示中文解释与推荐默认值；修改仅在本次程序运行期间保留。温度可填写单个值，或填写逗号分隔的回退序列，例如 `0, 0.2, 0.4`。参数范围覆盖语言、任务、采样/束搜索、提示词、上下文、时间戳、静音和低置信度回退等本地 `Whisper.transcribe()` 识别选项。
+
+### 仅补全字幕 B
+
+如果已经有一份翻译后的字幕 A，选择 GUI 中的“补全模式”。拖入原视频，并在“翻译字幕 A”处选择或拖入 `.srt` 文件。程序会读取 A 的时间轴，只对未覆盖的原视频片段进行日语识别，生成 `字幕A文件名_B.srt`。该模式不会修改 A，也不会重新识别 A 或生成合并字幕。
+
+### 从中日双语字幕提取中文字幕
+
+选择 GUI 中的“字幕拆分”模式，并拖入或选择中日双语 `.srt`。程序会保留每条字幕的第一行，生成 `原字幕文件名_zh.srt`；因此请确保中文翻译位于每条字幕的第一行。原字幕不会被修改。
+
 ## 终端运行（可选）
 
 ```powershell
-python openai_whisper_transcribe_only_certain_time_intervals.py "D:\\视频\\input.mp4" --output-dir "D:\\字幕"
+python openai_whisper_transcribe_only_certain_time_intervals.py "<视频文件路径>" --output-dir "<字幕保存文件夹>"
 ```
