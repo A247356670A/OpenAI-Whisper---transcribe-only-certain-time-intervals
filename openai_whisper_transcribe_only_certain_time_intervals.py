@@ -10,7 +10,6 @@ from pathlib import Path
 
 from subtitle_pipeline import run_two_pass_transcription
 
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="用 Whisper 生成日语字幕 A、B 和合并字幕。"
