@@ -5,7 +5,12 @@ def split_audio_by_intervals(audio_array, time_intervals=None, sr=16_000):
     """Return ``[start, end, samples]`` slices for the requested time ranges."""
     MIN_DURATION = 0.5  # 秒
 
-    # sort the audio segments by start time
+    # ``None`` explicitly requests the full recording; an empty list means
+    # every interval was excluded and must therefore produce no B segments.
+    if time_intervals is None:
+        time_intervals = [[0, len(audio_array) / sr]]
+
+    # Sort and drop tiny fragments that Whisper cannot transcribe reliably.
     time_intervals = sorted(time_intervals, key=lambda x: x[0])
     time_intervals = [
         interval
@@ -31,11 +36,5 @@ def split_audio_by_intervals(audio_array, time_intervals=None, sr=16_000):
                              ]
 
             audio_segments.append(audio_segment)
-
-    # if time_intervals is empty, define it as a single segment,
-    # from the beginning to the end (i.e. we're transcribing the full audio)
-    else:
-        time_intervals = [[0, len(audio_array) / sr]]
-        audio_segments = [0, len(audio_array / sr), audio_array]
 
     return audio_segments, time_intervals

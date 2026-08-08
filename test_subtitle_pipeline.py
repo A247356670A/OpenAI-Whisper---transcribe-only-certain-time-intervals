@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import subtitle_pipeline
 from whisper_options import build_whisper_options, default_option_values
+from split_audio_by_intervals import split_audio_by_intervals
 
 
 class _FakeModel:
@@ -65,6 +66,17 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(options["initial_prompt"], "固有名詞：ホロライブ")
         self.assertEqual(options["suppress_tokens"], [-1, 50363])
         self.assertFalse(options["fp16"])
+
+    def test_empty_intervals_do_not_restore_full_audio_for_b(self):
+        segments, intervals = split_audio_by_intervals([0.0] * 16_000, [], 16_000)
+        self.assertEqual(segments, [])
+        self.assertEqual(intervals, [])
+
+    def test_none_intervals_request_one_full_audio_segment(self):
+        segments, intervals = split_audio_by_intervals([0.0] * 16_000, None, 16_000)
+        self.assertEqual(intervals, [[0, 1.0]])
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0][:2], [0, 1.0])
 
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")
