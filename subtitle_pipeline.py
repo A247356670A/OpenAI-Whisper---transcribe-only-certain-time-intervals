@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
+import subprocess
 from typing import Any, Callable, Mapping
 from SrtMerge import merge_srt, write_srt
 from SrtToIntervals import extract_time_intervals
@@ -53,6 +54,15 @@ class SubtitleSplitOutput:
     chinese_only: Path
 
 
+@dataclass(frozen=True)
+class BurnedSubtitleVideoOutput:
+    """An MP4 video whose image permanently includes the selected subtitles."""
+
+    source_video: Path
+    source_subtitle: Path
+    burned_video: Path
+
+
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
     """Return predictable, Unicode-safe output names for a video."""
     stem = Path(video_path).stem
@@ -78,6 +88,12 @@ def build_chinese_only_path(
     """Return the non-destructive output name for Chinese-only subtitles."""
     source = Path(bilingual_subtitle_path)
     return Path(output_dir) / f"{source.stem}_zh.srt"
+
+
+def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> Path:
+    """Return the non-destructive MP4 filename for a subtitle-burned video."""
+    source = Path(video_path)
+    return Path(output_dir) / f"{source.stem}_burned_subtitles.mp4"
 
 
 def _log(callback: LogCallback | None, message: str) -> None:
@@ -342,3 +358,99 @@ def extract_chinese_subtitles(
     )
     _log(log_callback, f"已从 {converted_count} 条字幕中保留第一行中文：{chinese_only}")
     return SubtitleSplitOutput(source_subtitle=source, chinese_only=chinese_only)
+
+
+def _ffmpeg_filter_filename(path: Path) -> str:
+    """Escape a subtitle path for FFmpeg's ``subtitles`` video filter."""
+    value = path.resolve().as_posix()
+    return (
+        value.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+        .replace(",", "\\,")
+    )
+
+
+def burn_subtitles_to_mp4(
+    video_path: str | Path,
+    subtitle_path: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    log_callback: LogCallback | None = None,
+) -> BurnedSubtitleVideoOutput:
+    """Convert a video to H.264/AAC MP4 while permanently burning in an SRT.
+
+    FFmpeg's ``subtitles`` filter (libass) draws the text into each video
+    frame. The resulting MP4 therefore shows captions in any player, but the
+    captions can no longer be switched off.
+    """
+    source_video = Path(video_path).expanduser().resolve()
+    source_subtitle = Path(subtitle_path).expanduser().resolve()
+    if not source_video.is_file():
+        raise FileNotFoundError(f"找不到视频文件：{source_video}")
+    if not source_subtitle.is_file() or source_subtitle.suffix.lower() != ".srt":
+        raise ValueError("请选择有效的 .srt 字幕文件。")
+
+    destination = (
+        Path(output_dir).expanduser().resolve() if output_dir else source_video.parent
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    burned_video = build_burned_video_path(source_video, destination)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。")
+
+    filter_value = f"subtitles=filename='{_ffmpeg_filter_filename(source_subtitle)}'"
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source_video),
+        "-vf",
+        filter_value,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(burned_video),
+    ]
+    _log(log_callback, "正在转码为 MP4 并把字幕烧录到画面中…")
+    _log(log_callback, "FFmpeg 会重新编码视频；时长取决于视频长度和电脑性能。")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if process.stdout:
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                _log(log_callback, line)
+    if process.wait() != 0:
+        raise RuntimeError("FFmpeg 烧录字幕失败。请查看运行日志中的 FFmpeg 错误信息。")
+    _log(log_callback, f"完成：字幕已烧录到 MP4：{burned_video}")
+    return BurnedSubtitleVideoOutput(
+        source_video=source_video,
+        source_subtitle=source_subtitle,
+        burned_video=burned_video,
+    )

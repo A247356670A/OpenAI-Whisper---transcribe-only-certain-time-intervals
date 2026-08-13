@@ -78,6 +78,34 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0][:2], [0, 1.0])
 
+    def test_burn_subtitles_builds_h264_mp4_command(self):
+        class _FakeProcess:
+            stdout = ["ffmpeg progress\n"]
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            video = folder / "原视频.mp4"
+            subtitle = folder / "中文字幕.srt"
+            video.touch()
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n测试\n", encoding="utf-8"
+            )
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
+            ):
+                output = subtitle_pipeline.burn_subtitles_to_mp4(video, subtitle, folder)
+
+            command = popen.call_args.args[0]
+            self.assertEqual(output.burned_video, folder / "原视频_burned_subtitles.mp4")
+            self.assertIn("libx264", command)
+            self.assertIn("aac", command)
+            self.assertTrue(any("subtitles=filename=" in part for part in command))
+
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")
         self.assertEqual(outputs.first_pass, Path("字幕") / "動画 01_A.srt")

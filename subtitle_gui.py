@@ -15,7 +15,9 @@ from tkinter import filedialog, messagebox, ttk
 from subtitle_pipeline import (
     build_output_paths,
     build_chinese_only_path,
+    build_burned_video_path,
     build_second_pass_path,
+    burn_subtitles_to_mp4,
     extract_chinese_subtitles,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
@@ -272,6 +274,13 @@ class SubtitleApp:
             variable=self.run_mode,
             command=self._on_mode_changed,
         ).pack(anchor="w", pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="烧录字幕：转换为 MP4 并把选定 SRT 永久写入画面",
+            value="burn_subtitles",
+            variable=self.run_mode,
+            command=self._on_mode_changed,
+        ).pack(anchor="w", pady=(4, 0))
 
         self.drop_zone = ttk.Label(
             self.root,
@@ -390,6 +399,13 @@ class SubtitleApp:
             self.subtitle_row.pack(fill="x", pady=7, after=self.video_row)
             self.drop_zone.configure(text="将视频拖到这里\n补全模式还需要在下方选择或拖入翻译字幕 A")
             self.threshold_entry.configure(state="disabled")
+        elif mode == "burn_subtitles":
+            self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self.subtitle_label.configure(text="烧录字幕")
+            self.subtitle_button.configure(text="选择 SRT")
+            self.subtitle_row.pack(fill="x", pady=7, after=self.video_row)
+            self.drop_zone.configure(text="将视频拖到这里\n然后在下方选择或拖入要烧录的 SRT 字幕")
+            self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
             self.video_row.pack_forget()
             self.subtitle_label.configure(text="中日双语字幕")
@@ -491,6 +507,19 @@ class SubtitleApp:
                 "本模式不会重新识别 A，也不会合并字幕。"
             )
             return
+        if mode == "burn_subtitles":
+            if not self.subtitle_a_path.get():
+                self.output_preview.set("烧录字幕模式：请选择要写入画面的 .srt 字幕。")
+                return
+            burned_video = build_burned_video_path(
+                self.video_path.get(), self.output_dir.get()
+            )
+            self.output_preview.set(
+                f"原视频（不会修改）：{Path(self.video_path.get()).name}\n"
+                f"烧录字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
+                f"输出 MP4（字幕永久写入画面）：{burned_video.name}"
+            )
+            return
         if mode == "first_only":
             first_pass = build_output_paths(
                 self.video_path.get(), self.output_dir.get()
@@ -520,14 +549,18 @@ class SubtitleApp:
         if not output and mode != "split_chinese":
             messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
             return
-        if mode in ("second_only", "split_chinese") and not subtitle_a:
-            required_name = "中日双语字幕" if mode == "split_chinese" else "翻译字幕 A"
+        if mode in ("second_only", "split_chinese", "burn_subtitles") and not subtitle_a:
+            required_name = {
+                "split_chinese": "中日双语字幕",
+                "second_only": "翻译字幕 A",
+                "burn_subtitles": "要烧录的字幕",
+            }[mode]
             messagebox.showwarning("请选择字幕", f"请选择{required_name}（.srt）。")
             return
         if mode == "split_chinese" and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
-        if mode == "split_chinese":
+        if mode in ("split_chinese", "burn_subtitles"):
             merge_gap, duplicate_threshold = 1.0, 0.5
         else:
             try:
@@ -542,6 +575,9 @@ class SubtitleApp:
         if mode == "split_chinese":
             split_output = build_chinese_only_path(subtitle_a, output)
             existing = [split_output.name] if split_output.exists() else []
+        elif mode == "burn_subtitles":
+            burned_video = build_burned_video_path(video, output)
+            existing = [burned_video.name] if burned_video.exists() else []
         elif mode == "second_only":
             existing = [
                 build_second_pass_path(subtitle_a, output).name
@@ -573,6 +609,7 @@ class SubtitleApp:
             "first_only": "仅生成 A",
             "second_only": "仅生成 B",
             "split_chinese": "提取中文字幕",
+            "burn_subtitles": "转换 MP4 并烧录字幕",
         }[mode]
         self._append_log(f"开始处理（{action}）：{video}")
         worker = threading.Thread(
@@ -636,6 +673,13 @@ class SubtitleApp:
                         output,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
+                elif mode == "burn_subtitles":
+                    result = burn_subtitles_to_mp4(
+                        video,
+                        subtitle_a,
+                        output,
+                        log_callback=lambda message: self.events.put(("log", message)),
+                    )
                 else:
                     result = run_two_pass_transcription(
                         video,
@@ -675,6 +719,11 @@ class SubtitleApp:
                         messagebox.showinfo(
                             "中文字幕已提取",
                             f"仅中文字幕已保存到：\n{result.chinese_only}",
+                        )
+                    elif mode == "burn_subtitles":
+                        messagebox.showinfo(
+                            "MP4 已生成",
+                            f"字幕已永久烧录到画面：\n{result.burned_video}",
                         )
                     else:
                         messagebox.showinfo(

@@ -50,6 +50,10 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 选择 GUI 中的“字幕拆分”模式，并拖入或选择中日双语 `.srt`。程序会保留每条字幕的第一行，生成 `原字幕文件名_zh.srt`；因此请确保中文翻译位于每条字幕的第一行。原字幕不会被修改。
 
+### 转换 MP4 并烧录字幕
+
+选择“烧录字幕”模式，选择原视频和要烧录的 `.srt` 字幕。程序会使用 FFmpeg 重新编码为兼容性较好的 H.264/AAC MP4，输出 `视频名_burned_subtitles.mp4`。字幕会永久写入画面，无法在播放器中关闭；原视频和字幕文件不会修改。
+
 ## 终端运行（可选）
 
 ```powershell
