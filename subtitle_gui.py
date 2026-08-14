@@ -179,9 +179,9 @@ class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("日语字幕提取器 · Whisper 双重识别")
-        self.root.geometry("1280x900")
-        self.root.minsize(1280, 900)
-        self.root.configure(padx=24, pady=20)
+        self.root.geometry("1600x900")
+        self.root.minsize(1100, 760)
+        self.root.configure(padx=18, pady=14)
 
         self.events: Queue[tuple[str, object]] = Queue()
         self.running = False
@@ -225,73 +225,77 @@ class SubtitleApp:
         ):
             try:
                 tkfont.nametofont(font_name).configure(
-                    family="Microsoft YaHei UI", size=17
+                    family="Microsoft YaHei UI", size=14
                 )
             except tk.TclError:
                 pass
         try:
             tkfont.nametofont("TkFixedFont").configure(
-                family="Consolas", size=17
+                family="Consolas", size=14
             )
         except tk.TclError:
             pass
 
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 26, "bold"))
+        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 23, "bold"))
         style.configure("Hint.TLabel", foreground="#5b6472")
-        style.configure("Drop.TLabel", anchor="center", padding=22, relief="solid")
+        style.configure("Drop.TLabel", anchor="center", padding=12, relief="solid")
 
     def _build(self) -> None:
-        ttk.Label(self.root, text="日语字幕提取器", style="Title.TLabel").pack(anchor="w")
+        header = ttk.Frame(self.root)
+        header.pack(fill="x", pady=(0, 9))
+        ttk.Label(header, text="日语字幕提取器", style="Title.TLabel").pack(side="left")
         ttk.Label(
-            self.root,
-            text="完整模式：识别 A → 补全 B → 合并；补全模式：使用已有翻译 A，只生成 B",
+            header,
+            text="拖入文件，选择所需功能后即可处理。所有输出均会另存，不修改原文件。",
             style="Hint.TLabel",
-        ).pack(anchor="w", pady=(3, 16))
+        ).pack(side="left", padx=(18, 0), pady=(5, 0))
 
-        mode_frame = ttk.LabelFrame(self.root, text="运行模式", padding=8)
-        mode_frame.pack(fill="x", pady=(0, 12))
+        mode_frame = ttk.LabelFrame(self.root, text="选择功能", padding=(10, 7))
+        mode_frame.pack(fill="x", pady=(0, 9))
+        for column in range(3):
+            mode_frame.columnconfigure(column, weight=1)
         ttk.Radiobutton(
             mode_frame,
             text="完整识别：自动生成 A、B 和合并字幕",
             value="full",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w")
+        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
         ttk.Radiobutton(
             mode_frame,
             text="仅生成字幕 A：只进行完整视频的第一轮日语识别",
             value="first_only",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
         ttk.Radiobutton(
             mode_frame,
             text="补全模式：提供翻译字幕 A，仅生成日语字幕 B",
             value="second_only",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=0, column=2, sticky="w")
         ttk.Radiobutton(
             mode_frame,
             text="字幕拆分：中日双语字幕 → 仅中文字幕",
             value="split_chinese",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(5, 0))
         ttk.Radiobutton(
             mode_frame,
             text="烧录字幕：转换为 MP4 并把选定 SRT 永久写入画面",
             value="burn_subtitles",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(5, 0))
         ttk.Radiobutton(
             mode_frame,
             text="转换视频：将视频转换为兼容 MP4（不添加字幕）",
             value="convert_mp4",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=1, column=2, sticky="w", pady=(5, 0))
 
         self.drop_zone = ttk.Label(
             self.root,
@@ -342,8 +346,8 @@ class SubtitleApp:
         self.output_button = ttk.Button(output_row, text="选择文件夹", command=self._choose_output_dir)
         self.output_button.pack(side="left")
 
-        options = ttk.LabelFrame(self.root, text="识别设置（默认值沿用原项目）", padding=10)
-        options.pack(fill="x", pady=(10, 7))
+        options = ttk.LabelFrame(self.root, text="处理设置", padding=(10, 7))
+        options.pack(fill="x", pady=(7, 6))
         ttk.Label(options, text="Whisper 模型").grid(row=0, column=0, sticky="w")
         self.model_box = ttk.Combobox(
             options,
@@ -359,7 +363,7 @@ class SubtitleApp:
         ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=4, sticky="w")
         self.threshold_entry = ttk.Entry(options, textvariable=self.duplicate_threshold, width=8)
         self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
-        ttk.Label(options, text="MP4 转换品质").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(options, text="MP4 转换品质").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.mp4_quality_box = ttk.Combobox(
             options,
             state="readonly",
@@ -367,26 +371,26 @@ class SubtitleApp:
             values=tuple(MP4_QUALITY_PRESETS),
             width=18,
         )
-        self.mp4_quality_box.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
+        self.mp4_quality_box.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
         self.mp4_quality_box.bind("<<ComboboxSelected>>", lambda _event: self._update_preview())
         ttk.Button(
             options,
             text="第一/二轮 Whisper 高级参数…",
             command=self._show_whisper_options,
-        ).grid(row=2, column=0, columnspan=6, sticky="w", pady=(12, 0))
+        ).grid(row=1, column=2, columnspan=4, sticky="w", padx=(26, 0), pady=(8, 0))
 
-        preview = ttk.LabelFrame(self.root, text="将生成的文件", padding=9)
-        preview.pack(fill="x", pady=(7, 10))
+        preview = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
+        preview.pack(fill="x", pady=(6, 7))
         ttk.Label(
             preview,
             textvariable=self.output_preview,
             justify="left",
             style="Hint.TLabel",
-            wraplength=700,
+            wraplength=1100,
         ).pack(anchor="w")
 
         button_row = ttk.Frame(self.root)
-        button_row.pack(fill="x", pady=(0, 9))
+        button_row.pack(fill="x", pady=(0, 7))
         self.start_button = ttk.Button(button_row, text="开始提取字幕", command=self._start)
         self.start_button.pack(side="left")
         self.open_button = ttk.Button(
@@ -400,7 +404,9 @@ class SubtitleApp:
 
         log_box = ttk.LabelFrame(self.root, text="运行日志", padding=7)
         log_box.pack(fill="both", expand=True)
-        self.log = tk.Text(log_box, height=12, wrap="word", state="disabled")
+        # Ten lines at the default font keep the log near one fifth of the
+        # 1280×900 default window, while still allowing it to grow on resize.
+        self.log = tk.Text(log_box, height=10, wrap="word", state="disabled")
         scrollbar = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.pack(side="left", fill="both", expand=True)
