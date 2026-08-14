@@ -102,9 +102,33 @@ class SubtitlePipelineTests(unittest.TestCase):
 
             command = popen.call_args.args[0]
             self.assertEqual(output.burned_video, folder / "原视频_burned_subtitles.mp4")
+            self.assertTrue(output.input_was_mp4)
             self.assertIn("libx264", command)
             self.assertIn("aac", command)
             self.assertTrue(any("subtitles=filename=" in part for part in command))
+
+    def test_burn_subtitles_marks_non_mp4_as_conversion_input(self):
+        class _FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            video = folder / "原视频.mkv"
+            subtitle = folder / "中文字幕.srt"
+            video.touch()
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n测试\n", encoding="utf-8")
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()),
+            ):
+                output = subtitle_pipeline.burn_subtitles_to_mp4(video, subtitle, folder)
+
+            self.assertFalse(output.input_was_mp4)
+            self.assertEqual(output.burned_video.suffix, ".mp4")
 
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")

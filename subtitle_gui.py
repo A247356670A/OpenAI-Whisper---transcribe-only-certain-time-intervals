@@ -514,10 +514,17 @@ class SubtitleApp:
             burned_video = build_burned_video_path(
                 self.video_path.get(), self.output_dir.get()
             )
+            input_video = Path(self.video_path.get())
+            mode_message = (
+                "输入已是 MP4，将直接烧录字幕。"
+                if input_video.suffix.lower() == ".mp4"
+                else f"输入为 {input_video.suffix or '未知格式'}，将转换为 MP4 后烧录字幕。"
+            )
             self.output_preview.set(
                 f"原视频（不会修改）：{Path(self.video_path.get()).name}\n"
                 f"烧录字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
-                f"输出 MP4（字幕永久写入画面）：{burned_video.name}"
+                f"输出 MP4（字幕永久写入画面）：{burned_video.name}\n"
+                + mode_message
             )
             return
         if mode == "first_only":

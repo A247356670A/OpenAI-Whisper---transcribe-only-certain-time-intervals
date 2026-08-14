@@ -61,6 +61,7 @@ class BurnedSubtitleVideoOutput:
     source_video: Path
     source_subtitle: Path
     burned_video: Path
+    input_was_mp4: bool
 
 
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
@@ -392,6 +393,7 @@ def burn_subtitles_to_mp4(
         raise FileNotFoundError(f"找不到视频文件：{source_video}")
     if not source_subtitle.is_file() or source_subtitle.suffix.lower() != ".srt":
         raise ValueError("请选择有效的 .srt 字幕文件。")
+    input_was_mp4 = source_video.suffix.lower() == ".mp4"
 
     destination = (
         Path(output_dir).expanduser().resolve() if output_dir else source_video.parent
@@ -431,8 +433,11 @@ def burn_subtitles_to_mp4(
         "+faststart",
         str(burned_video),
     ]
-    _log(log_callback, "正在转码为 MP4 并把字幕烧录到画面中…")
-    _log(log_callback, "FFmpeg 会重新编码视频；时长取决于视频长度和电脑性能。")
+    if input_was_mp4:
+        _log(log_callback, "输入已是 MP4，直接烧录字幕到新的 MP4 文件…")
+    else:
+        _log(log_callback, f"输入为 {source_video.suffix or '未知格式'}，正在转换为 MP4 并烧录字幕…")
+    _log(log_callback, "烧录字幕必须重新编码视频；时长取决于视频长度和电脑性能。")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -453,4 +458,5 @@ def burn_subtitles_to_mp4(
         source_video=source_video,
         source_subtitle=source_subtitle,
         burned_video=burned_video,
+        input_was_mp4=input_was_mp4,
     )
