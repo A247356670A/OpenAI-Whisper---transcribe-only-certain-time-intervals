@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 from typing import Any, Callable, Mapping
 from SrtMerge import merge_srt, write_srt
 from SrtToIntervals import extract_time_intervals
@@ -65,19 +66,11 @@ class BurnedSubtitleVideoOutput:
 
 
 @dataclass(frozen=True)
-class ConvertedVideoOutput:
-    """An MP4 video created from a source video without changing the source."""
+class DownloadedVideoOutput:
+    """The destination directory used for a completed yt-dlp MP4 download."""
 
-    source_video: Path
-    converted_video: Path
-    quality: str
-
-
-MP4_QUALITY_PRESETS = {
-    "高品质（默认）": {"crf": "18", "preset": "medium", "audio_bitrate": "192k"},
-    "平衡": {"crf": "23", "preset": "medium", "audio_bitrate": "160k"},
-    "节省空间": {"crf": "28", "preset": "medium", "audio_bitrate": "128k"},
-}
+    source_url: str
+    output_dir: Path
 
 
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
@@ -111,12 +104,6 @@ def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> P
     """Return the non-destructive MP4 filename for a subtitle-burned video."""
     source = Path(video_path)
     return Path(output_dir) / f"{source.stem}_burned_subtitles.mp4"
-
-
-def build_converted_video_path(video_path: str | Path, output_dir: str | Path) -> Path:
-    """Return the non-destructive MP4 filename for a converted video."""
-    source = Path(video_path)
-    return Path(output_dir) / f"{source.stem}_converted.mp4"
 
 
 def _log(callback: LogCallback | None, message: str) -> None:
@@ -396,59 +383,52 @@ def _ffmpeg_filter_filename(path: Path) -> str:
     )
 
 
-def convert_video_to_mp4(
-    video_path: str | Path,
-    output_dir: str | Path | None = None,
+def download_video_as_mp4(
+    link: str,
+    output_dir: str | Path,
     *,
-    quality: str = "高品质（默认）",
     log_callback: LogCallback | None = None,
-) -> ConvertedVideoOutput:
-    """Create a compatible H.264/AAC MP4 using one of the GUI quality presets."""
-    source_video = Path(video_path).expanduser().resolve()
-    if not source_video.is_file():
-        raise FileNotFoundError(f"找不到视频文件：{source_video}")
-    if quality not in MP4_QUALITY_PRESETS:
-        raise ValueError(f"未知的 MP4 转换品质：{quality}")
+) -> DownloadedVideoOutput:
+    """Download *link* as MP4 with the project's selected yt-dlp command."""
+    source_url = link.strip()
+    if not source_url:
+        raise ValueError("请输入视频链接。")
+    destination = Path(output_dir).expanduser().resolve()
+    if not destination.is_dir():
+        raise FileNotFoundError(f"找不到保存文件夹：{destination}")
+    try:
+        import yt_dlp  # noqa: F401 - verifies the module used by the command exists.
+    except ImportError as exc:
+        raise RuntimeError(
+            "缺少 yt-dlp。请在项目目录执行：\npython -m pip install -r requirements.txt"
+        ) from exc
 
-    destination = (
-        Path(output_dir).expanduser().resolve() if output_dir else source_video.parent
-    )
-    destination.mkdir(parents=True, exist_ok=True)
-    converted_video = build_converted_video_path(source_video, destination)
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        raise RuntimeError("未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。")
-
-    preset = MP4_QUALITY_PRESETS[quality]
     command = [
-        ffmpeg,
-        "-hide_banner",
-        "-y",
-        "-i",
-        str(source_video),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        preset["preset"],
-        "-crf",
-        preset["crf"],
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        preset["audio_bitrate"],
-        "-movflags",
-        "+faststart",
-        str(converted_video),
+        sys.executable,
+        "-m",
+        "yt_dlp",
+        "-c",
+        "-R",
+        "infinite",
+        "--retry-sleep",
+        "5",
+        "--http-chunk-size",
+        "1M",
+        "-f",
+        "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[ext=mp4]",
+        "--merge-output-format",
+        "mp4",
+        source_url,
     ]
-    _log(log_callback, f"正在转换为 MP4（{quality}）…")
+    _log(
+        log_callback,
+        '正在保存到目标文件夹：python -m yt_dlp -c -R infinite --retry-sleep 5 '
+        '--http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+'
+        'ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"',
+    )
     process = subprocess.Popen(
         command,
+        cwd=str(destination),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -461,13 +441,9 @@ def convert_video_to_mp4(
             if line:
                 _log(log_callback, line)
     if process.wait() != 0:
-        raise RuntimeError("FFmpeg 转换 MP4 失败。请查看运行日志中的 FFmpeg 错误信息。")
-    _log(log_callback, f"完成：已生成 MP4：{converted_video}")
-    return ConvertedVideoOutput(
-        source_video=source_video,
-        converted_video=converted_video,
-        quality=quality,
-    )
+        raise RuntimeError("yt-dlp 下载失败。请查看运行日志中的错误信息。")
+    _log(log_callback, f"完成：视频已保存到 {destination}")
+    return DownloadedVideoOutput(source_url=source_url, output_dir=destination)
 
 
 def burn_subtitles_to_mp4(

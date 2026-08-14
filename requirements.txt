@@ -5,3 +5,6 @@ torch
 
 # Native file drag-and-drop support for the desktop window
 tkinterdnd2
+
+# Link-based MP4 downloads in the GUI
+yt-dlp

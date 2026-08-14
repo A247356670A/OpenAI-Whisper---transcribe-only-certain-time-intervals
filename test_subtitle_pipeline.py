@@ -130,7 +130,7 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertFalse(output.input_was_mp4)
             self.assertEqual(output.burned_video.suffix, ".mp4")
 
-    def test_convert_video_to_mp4_uses_selected_quality(self):
+    def test_download_video_as_mp4_uses_requested_yt_dlp_command(self):
         class _FakeProcess:
             stdout = []
 
@@ -140,21 +140,23 @@ class SubtitlePipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             folder = Path(temporary_directory)
-            video = folder / "source.mkv"
-            video.touch()
             with (
-                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch.dict("sys.modules", {"yt_dlp": object()}),
                 patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
             ):
-                output = subtitle_pipeline.convert_video_to_mp4(
-                    video, folder, quality="节省空间"
+                output = subtitle_pipeline.download_video_as_mp4(
+                    "https://example.test/watch?v=123", folder
                 )
 
             command = popen.call_args.args[0]
-            self.assertEqual(output.converted_video, folder / "source_converted.mp4")
-            self.assertEqual(output.quality, "节省空间")
-            self.assertEqual(command[command.index("-crf") + 1], "28")
-            self.assertIn("libx264", command)
+            self.assertEqual(output.output_dir, folder)
+            self.assertEqual(output.source_url, "https://example.test/watch?v=123")
+            self.assertEqual(popen.call_args.kwargs["cwd"], str(folder))
+            self.assertEqual(command[command.index("-R") + 1], "infinite")
+            self.assertEqual(command[command.index("--retry-sleep") + 1], "5")
+            self.assertEqual(command[command.index("--http-chunk-size") + 1], "1M")
+            self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
+            self.assertEqual(command[-1], "https://example.test/watch?v=123")
 
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")

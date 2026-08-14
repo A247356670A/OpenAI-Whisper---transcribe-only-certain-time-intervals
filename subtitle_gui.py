@@ -16,12 +16,10 @@ from subtitle_pipeline import (
     build_output_paths,
     build_chinese_only_path,
     build_burned_video_path,
-    build_converted_video_path,
     build_second_pass_path,
     burn_subtitles_to_mp4,
-    convert_video_to_mp4,
+    download_video_as_mp4,
     extract_chinese_subtitles,
-    MP4_QUALITY_PRESETS,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
@@ -187,12 +185,12 @@ class SubtitleApp:
         self.running = False
         self.video_path = tk.StringVar()
         self.subtitle_a_path = tk.StringVar()
+        self.download_link = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
         self.model_name = tk.StringVar(value="large-v2")
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
-        self.mp4_quality = tk.StringVar(value="高品质（默认）")
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.first_whisper_values = {
             key: tk.StringVar(value=value)
@@ -291,8 +289,8 @@ class SubtitleApp:
         ).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(5, 0))
         ttk.Radiobutton(
             mode_frame,
-            text="转换视频：将视频转换为兼容 MP4（不添加字幕）",
-            value="convert_mp4",
+            text="下载 MP4：从链接下载兼容 MP4 视频",
+            value="download_mp4",
             variable=self.run_mode,
             command=self._on_mode_changed,
         ).grid(row=1, column=2, sticky="w", pady=(5, 0))
@@ -338,6 +336,11 @@ class SubtitleApp:
             self.subtitle_entry.drop_target_register(DND_FILES)
             self.subtitle_entry.dnd_bind("<<Drop>>", self._on_subtitle_drop)
 
+        self.link_row = ttk.Frame(self.root)
+        ttk.Label(self.link_row, text="视频链接", width=10).pack(side="left")
+        self.link_entry = ttk.Entry(self.link_row, textvariable=self.download_link)
+        self.link_entry.pack(side="left", fill="x", expand=True)
+
         output_row = ttk.Frame(self.root)
         output_row.pack(fill="x", pady=7)
         ttk.Label(output_row, text="保存位置", width=10).pack(side="left")
@@ -363,21 +366,11 @@ class SubtitleApp:
         ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=4, sticky="w")
         self.threshold_entry = ttk.Entry(options, textvariable=self.duplicate_threshold, width=8)
         self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
-        ttk.Label(options, text="MP4 转换品质").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.mp4_quality_box = ttk.Combobox(
-            options,
-            state="readonly",
-            textvariable=self.mp4_quality,
-            values=tuple(MP4_QUALITY_PRESETS),
-            width=18,
-        )
-        self.mp4_quality_box.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(8, 0))
-        self.mp4_quality_box.bind("<<ComboboxSelected>>", lambda _event: self._update_preview())
         ttk.Button(
             options,
             text="第一/二轮 Whisper 高级参数…",
             command=self._show_whisper_options,
-        ).grid(row=1, column=2, columnspan=4, sticky="w", padx=(26, 0), pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
         preview = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
         preview.pack(fill="x", pady=(6, 7))
@@ -405,7 +398,7 @@ class SubtitleApp:
         log_box = ttk.LabelFrame(self.root, text="运行日志", padding=7)
         log_box.pack(fill="both", expand=True)
         # Ten lines at the default font keep the log near one fifth of the
-        # 1280×900 default window, while still allowing it to grow on resize.
+        # 1600×900 default window, while still allowing it to grow on resize.
         self.log = tk.Text(log_box, height=10, wrap="word", state="disabled")
         scrollbar = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=scrollbar.set)
@@ -433,12 +426,15 @@ class SubtitleApp:
             self.subtitle_row.pack(fill="x", pady=7, after=self.video_row)
             self.drop_zone.configure(text="将视频拖到这里\n然后在下方选择或拖入要烧录的 SRT 字幕")
             self.threshold_entry.configure(state="disabled")
-        elif mode == "convert_mp4":
+        elif mode == "download_mp4":
+            self.drop_zone.pack_forget()
             self.subtitle_row.pack_forget()
-            self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
-            self.drop_zone.configure(text="将要转换的视频拖到这里\n将生成独立的兼容 MP4 文件，不添加字幕")
+            self.video_row.pack_forget()
+            self.link_row.pack(fill="x", pady=(0, 7), before=self.output_entry.master)
             self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
+            self.link_row.pack_forget()
+            self.drop_zone.pack(fill="x", before=self.subtitle_row)
             self.video_row.pack_forget()
             self.subtitle_label.configure(text="中日双语字幕")
             self.subtitle_button.configure(text="选择 SRT")
@@ -446,6 +442,8 @@ class SubtitleApp:
             self.drop_zone.configure(text="将中日双语 SRT 拖到这里\n或在下方点击“选择 SRT”")
             self.threshold_entry.configure(state="disabled")
         else:
+            self.link_row.pack_forget()
+            self.drop_zone.pack(fill="x", before=self.video_row)
             self.subtitle_row.pack_forget()
             self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
             if mode == "first_only":
@@ -511,6 +509,19 @@ class SubtitleApp:
 
     def _update_preview(self) -> None:
         mode = self.run_mode.get()
+        if mode == "download_mp4":
+            if not self.download_link.get().strip():
+                self.output_preview.set("下载 MP4 模式：请输入视频链接。")
+                return
+            if not self.output_dir.get():
+                self.output_preview.set("下载 MP4 模式：请选择视频保存文件夹。")
+                return
+            self.output_preview.set(
+                "将以 yt-dlp 下载兼容 MP4 视频\n"
+                f"链接：{self.download_link.get().strip()}\n"
+                f"保存位置：{self.output_dir.get()}"
+            )
+            return
         if mode == "split_chinese":
             if not self.subtitle_a_path.get():
                 self.output_preview.set("字幕拆分模式：请选择中日双语字幕文件。")
@@ -559,16 +570,6 @@ class SubtitleApp:
                 + mode_message
             )
             return
-        if mode == "convert_mp4":
-            converted_video = build_converted_video_path(
-                self.video_path.get(), self.output_dir.get()
-            )
-            self.output_preview.set(
-                f"原视频（不会修改）：{Path(self.video_path.get()).name}\n"
-                f"输出 MP4：{converted_video.name}\n"
-                f"转换品质：{self.mp4_quality.get()}"
-            )
-            return
         if mode == "first_only":
             first_pass = build_output_paths(
                 self.video_path.get(), self.output_dir.get()
@@ -590,10 +591,14 @@ class SubtitleApp:
             return
         video = self.video_path.get().strip()
         subtitle_a = self.subtitle_a_path.get().strip()
+        download_link = self.download_link.get().strip()
         output = self.output_dir.get().strip()
         mode = self.run_mode.get()
-        if mode != "split_chinese" and not video:
+        if mode not in ("split_chinese", "download_mp4") and not video:
             messagebox.showwarning("请选择视频", "请拖入视频文件，或点击“选择视频”。")
+            return
+        if mode == "download_mp4" and not download_link:
+            messagebox.showwarning("请输入链接", "请输入要下载的视频链接。")
             return
         if not output and mode != "split_chinese":
             messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
@@ -609,7 +614,7 @@ class SubtitleApp:
         if mode == "split_chinese" and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
-        if mode in ("split_chinese", "burn_subtitles", "convert_mp4"):
+        if mode in ("split_chinese", "burn_subtitles", "download_mp4"):
             merge_gap, duplicate_threshold = 1.0, 0.5
         else:
             try:
@@ -627,9 +632,8 @@ class SubtitleApp:
         elif mode == "burn_subtitles":
             burned_video = build_burned_video_path(video, output)
             existing = [burned_video.name] if burned_video.exists() else []
-        elif mode == "convert_mp4":
-            converted_video = build_converted_video_path(video, output)
-            existing = [converted_video.name] if converted_video.exists() else []
+        elif mode == "download_mp4":
+            existing = []
         elif mode == "second_only":
             existing = [
                 build_second_pass_path(subtitle_a, output).name
@@ -662,20 +666,21 @@ class SubtitleApp:
             "second_only": "仅生成 B",
             "split_chinese": "提取中文字幕",
             "burn_subtitles": "转换 MP4 并烧录字幕",
-            "convert_mp4": "转换 MP4",
+            "download_mp4": "下载 MP4",
         }[mode]
-        self._append_log(f"开始处理（{action}）：{video}")
+        source_description = download_link if mode == "download_mp4" else video
+        self._append_log(f"开始处理（{action}）：{source_description}")
         worker = threading.Thread(
             target=self._run_worker,
             args=(
                 mode,
                 video,
                 subtitle_a,
+                download_link,
                 output,
                 self.model_name.get(),
                 merge_gap,
                 duplicate_threshold,
-                self.mp4_quality.get(),
                 self._snapshot_whisper_values(self.first_whisper_values),
                 self._snapshot_whisper_values(self.second_whisper_values),
             ),
@@ -693,11 +698,11 @@ class SubtitleApp:
         mode: str,
         video: str,
         subtitle_a: str,
+        download_link: str,
         output: str,
         model_name: str,
         merge_gap: float,
         duplicate_threshold: float,
-        mp4_quality: str,
         first_whisper_values: dict[str, str],
         second_whisper_values: dict[str, str],
     ) -> None:
@@ -735,11 +740,10 @@ class SubtitleApp:
                         output,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
-                elif mode == "convert_mp4":
-                    result = convert_video_to_mp4(
-                        video,
+                elif mode == "download_mp4":
+                    result = download_video_as_mp4(
+                        download_link,
                         output,
-                        quality=mp4_quality,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
                 else:
@@ -787,10 +791,10 @@ class SubtitleApp:
                             "MP4 已生成",
                             f"字幕已永久烧录到画面：\n{result.burned_video}",
                         )
-                    elif mode == "convert_mp4":
+                    elif mode == "download_mp4":
                         messagebox.showinfo(
-                            "MP4 已生成",
-                            f"已按“{result.quality}”转换为：\n{result.converted_video}",
+                            "MP4 下载完成",
+                            f"视频已保存到：\n{result.output_dir}",
                         )
                     else:
                         messagebox.showinfo(
