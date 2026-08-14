@@ -130,6 +130,32 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertFalse(output.input_was_mp4)
             self.assertEqual(output.burned_video.suffix, ".mp4")
 
+    def test_convert_video_to_mp4_uses_selected_quality(self):
+        class _FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            video = folder / "source.mkv"
+            video.touch()
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
+            ):
+                output = subtitle_pipeline.convert_video_to_mp4(
+                    video, folder, quality="节省空间"
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(output.converted_video, folder / "source_converted.mp4")
+            self.assertEqual(output.quality, "节省空间")
+            self.assertEqual(command[command.index("-crf") + 1], "28")
+            self.assertIn("libx264", command)
+
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")
         self.assertEqual(outputs.first_pass, Path("字幕") / "動画 01_A.srt")

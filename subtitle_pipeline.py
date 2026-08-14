@@ -64,6 +64,22 @@ class BurnedSubtitleVideoOutput:
     input_was_mp4: bool
 
 
+@dataclass(frozen=True)
+class ConvertedVideoOutput:
+    """An MP4 video created from a source video without changing the source."""
+
+    source_video: Path
+    converted_video: Path
+    quality: str
+
+
+MP4_QUALITY_PRESETS = {
+    "高品质（默认）": {"crf": "18", "preset": "medium", "audio_bitrate": "192k"},
+    "平衡": {"crf": "23", "preset": "medium", "audio_bitrate": "160k"},
+    "节省空间": {"crf": "28", "preset": "medium", "audio_bitrate": "128k"},
+}
+
+
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
     """Return predictable, Unicode-safe output names for a video."""
     stem = Path(video_path).stem
@@ -95,6 +111,12 @@ def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> P
     """Return the non-destructive MP4 filename for a subtitle-burned video."""
     source = Path(video_path)
     return Path(output_dir) / f"{source.stem}_burned_subtitles.mp4"
+
+
+def build_converted_video_path(video_path: str | Path, output_dir: str | Path) -> Path:
+    """Return the non-destructive MP4 filename for a converted video."""
+    source = Path(video_path)
+    return Path(output_dir) / f"{source.stem}_converted.mp4"
 
 
 def _log(callback: LogCallback | None, message: str) -> None:
@@ -371,6 +393,80 @@ def _ffmpeg_filter_filename(path: Path) -> str:
         .replace("[", "\\[")
         .replace("]", "\\]")
         .replace(",", "\\,")
+    )
+
+
+def convert_video_to_mp4(
+    video_path: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    quality: str = "高品质（默认）",
+    log_callback: LogCallback | None = None,
+) -> ConvertedVideoOutput:
+    """Create a compatible H.264/AAC MP4 using one of the GUI quality presets."""
+    source_video = Path(video_path).expanduser().resolve()
+    if not source_video.is_file():
+        raise FileNotFoundError(f"找不到视频文件：{source_video}")
+    if quality not in MP4_QUALITY_PRESETS:
+        raise ValueError(f"未知的 MP4 转换品质：{quality}")
+
+    destination = (
+        Path(output_dir).expanduser().resolve() if output_dir else source_video.parent
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    converted_video = build_converted_video_path(source_video, destination)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。")
+
+    preset = MP4_QUALITY_PRESETS[quality]
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source_video),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset["preset"],
+        "-crf",
+        preset["crf"],
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        preset["audio_bitrate"],
+        "-movflags",
+        "+faststart",
+        str(converted_video),
+    ]
+    _log(log_callback, f"正在转换为 MP4（{quality}）…")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if process.stdout:
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                _log(log_callback, line)
+    if process.wait() != 0:
+        raise RuntimeError("FFmpeg 转换 MP4 失败。请查看运行日志中的 FFmpeg 错误信息。")
+    _log(log_callback, f"完成：已生成 MP4：{converted_video}")
+    return ConvertedVideoOutput(
+        source_video=source_video,
+        converted_video=converted_video,
+        quality=quality,
     )
 
 
