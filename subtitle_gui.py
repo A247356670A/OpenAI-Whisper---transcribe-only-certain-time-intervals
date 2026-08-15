@@ -7,6 +7,7 @@ import ctypes
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import random
 import re
 import sys
 import threading
@@ -27,12 +28,15 @@ from subtitle_pipeline import (
     download_video_as_mp4,
     extract_chinese_subtitles,
     format_srt_entries,
+    generate_subtitle_preview,
     parse_editable_srt_text,
     prepare_manual_subtitle_merge,
     prepare_hallucination_cleanup,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
+    SUBTITLE_COLOR_CHOICES,
+    SUBTITLE_FONT_CHOICES,
 )
 from whisper_options import WHISPER_OPTION_SPECS, default_option_values
 
@@ -407,6 +411,11 @@ class SubtitleApp:
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
         self.filter_silent_b = tk.BooleanVar(value=True)
+        self.burn_font_name = tk.StringVar(value="微软雅黑")
+        self.burn_font_color = tk.StringVar(value="白色")
+        self.burn_font_size = tk.StringVar(value="16")
+        self.burn_outline_size = tk.StringVar(value="0.8")
+        self.burn_margin_v = tk.StringVar(value="10")
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="等待开始。")
@@ -632,10 +641,47 @@ class SubtitleApp:
             command=self._show_whisper_options,
         ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(26, 0), pady=(8, 0))
 
-        preview = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
-        preview.pack(fill="x", pady=(6, 7))
+        self.burn_style_frame = ttk.LabelFrame(
+            self.root, text="烧录字幕样式", padding=(10, 7)
+        )
+        ttk.Label(self.burn_style_frame, text="字体").grid(row=0, column=0, sticky="w")
+        self.burn_font_box = ttk.Combobox(
+            self.burn_style_frame,
+            textvariable=self.burn_font_name,
+            values=SUBTITLE_FONT_CHOICES,
+            width=22,
+        )
+        self.burn_font_box.grid(row=0, column=1, sticky="w", padx=(8, 22))
+        ttk.Label(self.burn_style_frame, text="颜色").grid(row=0, column=2, sticky="w")
+        self.burn_color_box = ttk.Combobox(
+            self.burn_style_frame,
+            state="readonly",
+            textvariable=self.burn_font_color,
+            values=tuple(SUBTITLE_COLOR_CHOICES),
+            width=10,
+        )
+        self.burn_color_box.grid(row=0, column=3, sticky="w", padx=(8, 22))
+        ttk.Label(self.burn_style_frame, text="字号").grid(row=0, column=4, sticky="w")
+        ttk.Entry(self.burn_style_frame, textvariable=self.burn_font_size, width=6).grid(
+            row=0, column=5, sticky="w", padx=(8, 22)
+        )
+        ttk.Label(self.burn_style_frame, text="黑色描边").grid(row=0, column=6, sticky="w")
+        ttk.Entry(self.burn_style_frame, textvariable=self.burn_outline_size, width=6).grid(
+            row=0, column=7, sticky="w", padx=(8, 18)
+        )
+        ttk.Label(self.burn_style_frame, text="距底部").grid(row=0, column=8, sticky="w")
+        ttk.Entry(self.burn_style_frame, textvariable=self.burn_margin_v, width=6).grid(
+            row=0, column=9, sticky="w", padx=(8, 18)
+        )
+        self.style_preview_button = ttk.Button(
+            self.burn_style_frame, text="预览字幕样式", command=self._preview_burn_style
+        )
+        self.style_preview_button.grid(row=0, column=10, sticky="w")
+
+        self.preview_frame = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
+        self.preview_frame.pack(fill="x", pady=(6, 7))
         ttk.Label(
-            preview,
+            self.preview_frame,
             textvariable=self.output_preview,
             justify="left",
             style="Hint.TLabel",
@@ -686,6 +732,10 @@ class SubtitleApp:
     def _on_mode_changed(self) -> None:
         mode = self.run_mode.get()
         self._reset_input_area()
+        if mode == "burn_subtitles":
+            self.burn_style_frame.pack(fill="x", pady=(0, 6), before=self.preview_frame)
+        else:
+            self.burn_style_frame.pack_forget()
         if mode == "second_only":
             self._show_drop_zone()
             self.video_row.pack(fill="x", pady=(14, 7))
@@ -765,6 +815,152 @@ class SubtitleApp:
         path = filedialog.askopenfilename(title="选择视频或音频文件", filetypes=VIDEO_FILE_TYPES)
         if path:
             self._set_video(path)
+
+    def _get_burn_style_values(self) -> tuple[str, int, str, float, int]:
+        """Read and validate the editable font controls before FFmpeg is started."""
+        font_name = self.burn_font_name.get().strip()
+        try:
+            font_size = int(self.burn_font_size.get())
+            outline_size = float(self.burn_outline_size.get())
+            margin_v = int(self.burn_margin_v.get())
+        except ValueError as exc:
+            raise ValueError("字幕字号和距底部必须是整数，描边宽度必须是数字。") from exc
+        if not font_name:
+            raise ValueError("请输入字幕字体名称，或从列表中选择一种字体。")
+        if any(character in font_name for character in "',:"):
+            raise ValueError("字体名称不能包含英文逗号、冒号或引号。")
+        if not 12 <= font_size <= 160:
+            raise ValueError("字幕字号应在 12 到 160 之间。")
+        if not 0 <= outline_size <= 12:
+            raise ValueError("黑色描边宽度应在 0 到 12 之间。")
+        if not 0 <= margin_v <= 1000:
+            raise ValueError("距底部应在 0 到 1000 之间。")
+        if self.burn_font_color.get() not in SUBTITLE_COLOR_CHOICES:
+            raise ValueError("请选择列表中的字幕颜色。")
+        return font_name, font_size, self.burn_font_color.get(), outline_size, margin_v
+
+    def _preview_burn_style(self) -> None:
+        """Render a styled still frame in a worker so the main window stays responsive."""
+        self._request_burn_style_preview(preview_index=0)
+
+    def _request_burn_style_preview(
+        self, *, preview_index: int, preview_window: tk.Toplevel | None = None
+    ) -> None:
+        """Render a selected subtitle frame with the current style controls."""
+        if self.running:
+            messagebox.showwarning("正在处理", "请等待当前任务完成后再生成样式预览。")
+            return
+        video = self.video_path.get().strip()
+        subtitle = self.subtitle_a_path.get().strip()
+        output = self.output_dir.get().strip()
+        if not video or not subtitle:
+            messagebox.showwarning("请先选择文件", "请先选择视频和要烧录的 SRT 字幕。")
+            return
+        if not output:
+            output = str(Path(video).parent)
+            self.output_dir.set(output)
+        try:
+            font_name, font_size, font_color, outline_size, margin_v = self._get_burn_style_values()
+        except ValueError as exc:
+            messagebox.showwarning("样式设置不正确", str(exc))
+            return
+        self.style_preview_button.configure(state="disabled")
+        if preview_window is not None and preview_window.winfo_exists():
+            preview_window.refresh_button.configure(state="disabled")
+        self.status.set("正在生成字幕样式预览…")
+        worker = threading.Thread(
+            target=self._run_style_preview_worker,
+            args=(
+                video,
+                subtitle,
+                output,
+                font_name,
+                font_size,
+                font_color,
+                outline_size,
+                margin_v,
+                preview_index,
+                preview_window,
+            ),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_style_preview_worker(
+        self,
+        video: str,
+        subtitle: str,
+        output: str,
+        font_name: str,
+        font_size: int,
+        font_color: str,
+        outline_size: float,
+        margin_v: int,
+        preview_index: int,
+        preview_window: tk.Toplevel | None,
+    ) -> None:
+        try:
+            result = generate_subtitle_preview(
+                video,
+                subtitle,
+                output,
+                font_name=font_name,
+                font_size=font_size,
+                font_color=font_color,
+                outline_size=outline_size,
+                margin_v=margin_v,
+                preview_index=preview_index,
+                log_callback=lambda message: self.events.put(("log", message)),
+            )
+            self.events.put(("preview", (result, preview_window)))
+        except Exception as exc:
+            self.events.put(("preview_error", (str(exc), preview_window)))
+
+    def _show_subtitle_preview(self, result, preview_window: tk.Toplevel | None = None) -> None:
+        """Open the PNG created by FFmpeg and keep its Tk image alive."""
+        try:
+            if preview_window is None or not preview_window.winfo_exists():
+                preview_window = tk.Toplevel(self.root)
+                preview_window.title("字幕样式预览")
+                preview_window.transient(self.root)
+            for child in preview_window.winfo_children():
+                child.destroy()
+            image = tk.PhotoImage(file=str(result.preview_image))
+            image_label = ttk.Label(preview_window, image=image)
+            image_label.image = image
+            image_label.pack(padx=12, pady=(12, 7))
+            ttk.Label(
+                preview_window,
+                text=(
+                    f"预览第 {result.preview_index + 1}/{result.subtitle_count} 条字幕，"
+                    f"画面时间：{result.preview_time:.2f} 秒\n"
+                    "这是烧录到视频中的实际样式；确认后可点击“开始处理”。"
+                ),
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=(0, 12))
+            preview_window.refresh_button = ttk.Button(
+                preview_window,
+                text="刷新：预览后面随机 5–10 条字幕",
+                command=lambda: self._refresh_subtitle_preview(preview_window, result),
+            )
+            preview_window.refresh_button.pack(anchor="e", padx=12, pady=(0, 12))
+        except tk.TclError as exc:
+            messagebox.showerror(
+                "无法显示预览",
+                f"预览图片已生成，但无法在窗口中打开：\n{result.preview_image}\n\n{exc}",
+            )
+
+    def _refresh_subtitle_preview(self, preview_window: tk.Toplevel, result) -> None:
+        """Move to a later caption so a second frame can verify the current style."""
+        if result.subtitle_count < 2:
+            messagebox.showinfo("无法切换", "字幕文件只有一条字幕，无法切换到下一处预览。")
+            return
+        next_index = (result.preview_index + random.randint(5, 10)) % result.subtitle_count
+        if next_index == result.preview_index:
+            next_index = (result.preview_index + 1) % result.subtitle_count
+        self._request_burn_style_preview(
+            preview_index=next_index, preview_window=preview_window
+        )
 
     def _on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
@@ -935,6 +1131,11 @@ class SubtitleApp:
                 f"烧录字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
                 f"输出 MP4（字幕永久写入画面）：{burned_video.name}\n"
                 + mode_message
+                + "\n样式："
+                + f"{self.burn_font_name.get() or '未选择字体'} / "
+                + f"{self.burn_font_color.get()} / {self.burn_font_size.get()} 号 / "
+                + f"黑色描边 {self.burn_outline_size.get()} / "
+                + f"距底部 {self.burn_margin_v.get()}"
             )
             return
         if mode == "first_only":
@@ -1057,6 +1258,15 @@ class SubtitleApp:
             self._start_hallucination_cleanup(subtitle_a, output)
             return
 
+        if mode == "burn_subtitles":
+            try:
+                font_name, font_size, font_color, outline_size, margin_v = self._get_burn_style_values()
+            except ValueError as exc:
+                messagebox.showwarning("样式设置不正确", str(exc))
+                return
+        else:
+            font_name, font_size, font_color, outline_size, margin_v = "微软雅黑", 16, "白色", 0.8, 10
+
         self.running = True
         self.start_button.configure(state="disabled")
         self.status.set("正在处理，请保持此窗口打开…")
@@ -1084,6 +1294,11 @@ class SubtitleApp:
                 merge_gap,
                 duplicate_threshold,
                 self.filter_silent_b.get(),
+                font_name,
+                font_size,
+                font_color,
+                outline_size,
+                margin_v,
                 self._snapshot_whisper_values(self.first_whisper_values),
                 self._snapshot_whisper_values(self.second_whisper_values),
             ),
@@ -1164,6 +1379,11 @@ class SubtitleApp:
         merge_gap: float,
         duplicate_threshold: float,
         filter_silent_b: bool,
+        font_name: str,
+        font_size: int,
+        font_color: str,
+        outline_size: float,
+        margin_v: int,
         first_whisper_values: dict[str, str],
         second_whisper_values: dict[str, str],
     ) -> None:
@@ -1206,6 +1426,11 @@ class SubtitleApp:
                         video,
                         subtitle_a,
                         output,
+                        font_name=font_name,
+                        font_size=font_size,
+                        font_color=font_color,
+                        outline_size=outline_size,
+                        margin_v=margin_v,
                         log_callback=lambda message: self.events.put(("log", message)),
                         progress_callback=lambda stage, current, total: self.events.put(
                             ("progress", (stage, current, total))
@@ -1257,6 +1482,23 @@ class SubtitleApp:
                     log_messages.clear()
                     stage, current, total = payload
                     self._set_progress(str(stage), float(current), float(total))
+                elif event_type == "preview":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
+                    self.style_preview_button.configure(state="normal")
+                    self.status.set("字幕样式预览已生成。")
+                    result, preview_window = payload
+                    self._show_subtitle_preview(result, preview_window)
+                elif event_type == "preview_error":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
+                    self.style_preview_button.configure(state="normal")
+                    self.status.set("字幕样式预览失败，请查看运行日志。")
+                    error_message, preview_window = payload
+                    if preview_window is not None and preview_window.winfo_exists():
+                        preview_window.refresh_button.configure(state="normal")
+                    self._append_log(f"预览错误：{error_message}")
+                    messagebox.showerror("预览失败", str(error_message))
                 elif event_type == "success":
                     self._append_log_batch(log_messages)
                     log_messages.clear()

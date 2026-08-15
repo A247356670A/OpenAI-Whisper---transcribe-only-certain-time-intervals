@@ -64,6 +64,8 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 选择“烧录字幕”模式，选择原视频和要烧录的 `.srt` 字幕。输入已是 MP4 时，程序会直接烧录字幕；其他格式会在生成最终文件时转换为兼容性较好的 H.264/AAC MP4。输出为 `视频名_burned_subtitles.mp4`。字幕会永久写入画面，无法在播放器中关闭；原视频和字幕文件不会修改。
 
+烧录前可选择字体、颜色、字号、黑色描边宽度和“距底部”位置。默认使用微软雅黑、白色、16 号、描边 0.8、距底部 10，以提高中日字幕在明暗画面中的可读性；距底部数值越大，字幕越向上移动。点击“预览字幕样式”会从第一条字幕的位置生成一张预览图，不会修改视频。预览窗口中的“刷新”会按当前样式随机跳到后面 5–10 条字幕并重新渲染一帧，方便检查不同对白和画面上的效果；若某种字体仍显示异常，请从下拉列表换用 `Noto Sans CJK SC`、`SimHei`、`Meiryo` 或输入电脑上已安装的字体名称后再预览。
+
 ### 从链接下载 MP4
 
 选择“下载 MP4”模式，输入视频链接并选择保存文件夹。程序会在该文件夹中运行 `python -m yt_dlp -c -R infinite --retry-sleep 5 --http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"`，下载日志会显示在窗口底部。

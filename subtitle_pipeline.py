@@ -81,6 +81,16 @@ class BurnedSubtitleVideoOutput:
 
 
 @dataclass(frozen=True)
+class SubtitlePreviewOutput:
+    """A rendered image used to verify subtitle font and colour before burning."""
+
+    preview_image: Path
+    preview_time: float
+    preview_index: int
+    subtitle_count: int
+
+
+@dataclass(frozen=True)
 class DownloadedVideoOutput:
     """The destination directory used for a completed yt-dlp MP4 download."""
 
@@ -89,6 +99,29 @@ class DownloadedVideoOutput:
 
 
 SubtitleEntry = tuple[float, float, str]
+
+
+SUBTITLE_FONT_CHOICES = (
+    "微软雅黑",
+    "Microsoft YaHei",
+    "Microsoft YaHei UI",
+    "Noto Sans CJK SC",
+    "SimHei",
+    "Meiryo",
+    "Yu Gothic UI",
+)
+
+# Windows exposes the font as Microsoft YaHei to FFmpeg/libass, while the
+# Chinese name is easier to recognise in the GUI.
+SUBTITLE_FONT_ALIASES = {"微软雅黑": "Microsoft YaHei"}
+
+SUBTITLE_COLOR_CHOICES = {
+    "白色": "&H00FFFFFF",
+    "黄色": "&H0000FFFF",
+    "青色": "&H00FFFF00",
+    "绿色": "&H0000FF00",
+    "粉红色": "&H00CC66FF",
+}
 
 
 @dataclass(frozen=True)
@@ -178,6 +211,12 @@ def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> P
     """Return the non-destructive MP4 filename for a subtitle-burned video."""
     source = Path(video_path)
     return Path(output_dir) / f"{source.stem}_burned_subtitles.mp4"
+
+
+def build_subtitle_preview_path(video_path: str | Path, output_dir: str | Path) -> Path:
+    """Return the disposable PNG path used by the subtitle-style preview."""
+    source = Path(video_path)
+    return Path(output_dir) / f"{source.stem}_subtitle_style_preview.png"
 
 
 def build_manual_merge_path(
@@ -890,6 +929,126 @@ def _ffmpeg_filter_filename(path: Path) -> str:
     )
 
 
+def _build_subtitle_filter(
+    subtitle_path: Path,
+    *,
+    font_name: str,
+    font_size: int,
+    font_color: str,
+    outline_size: float,
+    margin_v: int,
+) -> str:
+    """Build a libass filter with an explicit, readable CJK subtitle style."""
+    font_name = SUBTITLE_FONT_ALIASES.get(font_name.strip(), font_name.strip())
+    if not font_name or any(character in font_name for character in "',:"):
+        raise ValueError("字体名称不能为空，且不能包含英文逗号、冒号或引号。")
+    if not 12 <= font_size <= 160:
+        raise ValueError("字幕字号必须在 12 到 160 之间。")
+    if not 0 <= outline_size <= 12:
+        raise ValueError("字幕描边宽度必须在 0 到 12 之间。")
+    if not 0 <= margin_v <= 1000:
+        raise ValueError("字幕距底部位置必须在 0 到 1000 之间。")
+    try:
+        primary_colour = SUBTITLE_COLOR_CHOICES[font_color]
+    except KeyError as exc:
+        raise ValueError("请选择列表中的字幕颜色。") from exc
+    # ASS uses &HAABBGGRR.  A black outline keeps every selectable text colour
+    # readable on bright footage; Alignment=2 anchors captions at the bottom.
+    force_style = (
+        f"FontName={font_name},FontSize={font_size},"
+        f"PrimaryColour={primary_colour},OutlineColour=&H00000000,"
+        f"BorderStyle=1,Outline={outline_size:g},Shadow=0,Alignment=2,MarginV={margin_v}"
+    )
+    return (
+        f"subtitles=filename='{_ffmpeg_filter_filename(subtitle_path)}':"
+        f"force_style='{force_style}'"
+    )
+
+
+def generate_subtitle_preview(
+    video_path: str | Path,
+    subtitle_path: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    font_name: str = "微软雅黑",
+    font_size: int = 16,
+    font_color: str = "白色",
+    outline_size: float = 0.8,
+    margin_v: int = 10,
+    preview_index: int = 0,
+    log_callback: LogCallback | None = None,
+) -> SubtitlePreviewOutput:
+    """Render a single styled subtitle frame without changing the source video."""
+    source_video = Path(video_path).expanduser().resolve()
+    source_subtitle = Path(subtitle_path).expanduser().resolve()
+    if not source_video.is_file():
+        raise FileNotFoundError(f"找不到视频文件：{source_video}")
+    if not source_subtitle.is_file() or source_subtitle.suffix.lower() != ".srt":
+        raise ValueError("请选择有效的 .srt 字幕文件。")
+    destination = (
+        Path(output_dir).expanduser().resolve() if output_dir else source_video.parent
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。")
+    entries = _read_srt_entries(source_subtitle)
+    if not entries:
+        raise ValueError("字幕文件没有可用于预览的字幕内容。")
+    if not 0 <= preview_index < len(entries):
+        raise ValueError("预览字幕序号超出字幕文件范围。")
+    preview_time = entries[preview_index][0] + 0.05
+    preview_image = build_subtitle_preview_path(source_video, destination)
+    subtitle_filter = _build_subtitle_filter(
+        source_subtitle,
+        font_name=font_name,
+        font_size=font_size,
+        font_color=font_color,
+        outline_size=outline_size,
+        margin_v=margin_v,
+    )
+    # Fast seek to the first caption, then restore its source PTS so libass
+    # evaluates the SRT at the correct point on the original timeline.
+    filter_value = f"setpts=PTS+{preview_time:.3f}/TB,{subtitle_filter},scale='min(960,iw)':-2"
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-ss",
+        f"{preview_time:.3f}",
+        "-i",
+        str(source_video),
+        "-vf",
+        filter_value,
+        "-frames:v",
+        "1",
+        str(preview_image),
+    ]
+    _log(log_callback, "正在生成字幕样式预览…")
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if process.stdout:
+        for line in process.stdout:
+            line = line.strip()
+            if line:
+                _log(log_callback, line)
+    if process.wait() != 0 or not preview_image.is_file():
+        raise RuntimeError("字幕样式预览生成失败。请查看运行日志中的 FFmpeg 错误信息。")
+    _log(log_callback, f"字幕样式预览已生成：{preview_image}")
+    return SubtitlePreviewOutput(
+        preview_image=preview_image,
+        preview_time=preview_time,
+        preview_index=preview_index,
+        subtitle_count=len(entries),
+    )
+
+
 def download_video_as_mp4(
     link: str,
     output_dir: str | Path,
@@ -961,6 +1120,11 @@ def burn_subtitles_to_mp4(
     subtitle_path: str | Path,
     output_dir: str | Path | None = None,
     *,
+    font_name: str = "微软雅黑",
+    font_size: int = 16,
+    font_color: str = "白色",
+    outline_size: float = 0.8,
+    margin_v: int = 10,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> BurnedSubtitleVideoOutput:
@@ -987,7 +1151,14 @@ def burn_subtitles_to_mp4(
     if not ffmpeg:
         raise RuntimeError("未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。")
 
-    filter_value = f"subtitles=filename='{_ffmpeg_filter_filename(source_subtitle)}'"
+    filter_value = _build_subtitle_filter(
+        source_subtitle,
+        font_name=font_name,
+        font_size=font_size,
+        font_color=font_color,
+        outline_size=outline_size,
+        margin_v=margin_v,
+    )
     command = [
         ffmpeg,
         "-hide_banner",

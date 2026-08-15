@@ -124,14 +124,77 @@ class SubtitlePipelineTests(unittest.TestCase):
                 patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
                 patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
             ):
-                output = subtitle_pipeline.burn_subtitles_to_mp4(video, subtitle, folder)
+                output = subtitle_pipeline.burn_subtitles_to_mp4(
+                    video,
+                    subtitle,
+                    folder,
+                    font_name="Meiryo",
+                    font_size=52,
+                    font_color="黄色",
+                    outline_size=3,
+                    margin_v=72,
+                )
 
             command = popen.call_args.args[0]
+            subtitle_filter = command[command.index("-vf") + 1]
             self.assertEqual(output.burned_video, folder / "原视频_burned_subtitles.mp4")
             self.assertTrue(output.input_was_mp4)
             self.assertIn("libx264", command)
             self.assertIn("aac", command)
-            self.assertTrue(any("subtitles=filename=" in part for part in command))
+            self.assertIn("subtitles=filename=", subtitle_filter)
+            self.assertIn("FontName=Meiryo", subtitle_filter)
+            self.assertIn("FontSize=52", subtitle_filter)
+            self.assertIn("PrimaryColour=&H0000FFFF", subtitle_filter)
+            self.assertIn("Outline=3", subtitle_filter)
+            self.assertIn("MarginV=72", subtitle_filter)
+
+    def test_subtitle_style_preview_uses_selected_style(self):
+        class _FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            video = folder / "原视频.mp4"
+            subtitle = folder / "中文字幕.srt"
+            video.touch()
+            subtitle.write_text(
+                "1\n00:00:02,000 --> 00:00:03,000\n测试\n", encoding="utf-8"
+            )
+
+            def fake_popen(command, **_kwargs):
+                Path(command[-1]).touch()
+                return _FakeProcess()
+
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch("subtitle_pipeline.subprocess.Popen", side_effect=fake_popen) as popen,
+            ):
+                preview = subtitle_pipeline.generate_subtitle_preview(
+                    video,
+                    subtitle,
+                    folder,
+                    font_name="SimHei",
+                    font_size=50,
+                    font_color="青色",
+                    outline_size=2,
+                    margin_v=64,
+                )
+
+            command = popen.call_args.args[0]
+            subtitle_filter = command[command.index("-vf") + 1]
+            self.assertEqual(preview.preview_time, 2.05)
+            self.assertEqual(preview.preview_index, 0)
+            self.assertEqual(preview.subtitle_count, 1)
+            self.assertTrue(preview.preview_image.is_file())
+            self.assertIn("-frames:v", command)
+            self.assertIn("FontName=SimHei", subtitle_filter)
+            self.assertIn("FontSize=50", subtitle_filter)
+            self.assertIn("PrimaryColour=&H00FFFF00", subtitle_filter)
+            self.assertIn("MarginV=64", subtitle_filter)
 
     def test_burn_subtitles_marks_non_mp4_as_conversion_input(self):
         class _FakeProcess:
