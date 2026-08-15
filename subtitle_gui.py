@@ -7,6 +7,7 @@ import ctypes
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import sys
 import threading
 import tkinter as tk
@@ -419,6 +420,10 @@ class SubtitleApp:
         self.duplicate_threshold = tk.StringVar(value="0.5")
         self.filter_silent_b = tk.BooleanVar(value=True)
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
+        self.progress_value = tk.DoubleVar(value=0)
+        self.progress_text = tk.StringVar(value="等待开始。")
+        self._progress_stage = ""
+        self._progress_total = 0.0
         self.first_whisper_values = {
             key: tk.StringVar(value=value)
             for key, value in default_option_values("first").items()
@@ -679,6 +684,19 @@ class SubtitleApp:
         ttk.Label(button_row, textvariable=self.status, style="Hint.TLabel").pack(
             side="right"
         )
+
+        progress_row = ttk.Frame(self.root)
+        progress_row.pack(fill="x", pady=(0, 7))
+        ttk.Label(progress_row, textvariable=self.progress_text, style="Hint.TLabel", width=26).pack(
+            side="left"
+        )
+        self.progress_bar = ttk.Progressbar(
+            progress_row,
+            variable=self.progress_value,
+            maximum=100,
+            mode="determinate",
+        )
+        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8, 0))
 
         log_box = ttk.LabelFrame(self.root, text="运行日志", padding=7)
         log_box.pack(fill="both", expand=True)
@@ -1077,6 +1095,7 @@ class SubtitleApp:
         self.running = True
         self.start_button.configure(state="disabled")
         self.status.set("正在处理，请保持此窗口打开…")
+        self._set_progress("preparing", 0, 0)
         self._append_log("=" * 54)
         action = {
             "full": "完整识别",
@@ -1198,6 +1217,9 @@ class SubtitleApp:
                         filter_silent_b=filter_silent_b,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(
+                            ("progress", (stage, current, total))
+                        ),
                     )
                 elif mode == "first_only":
                     result = run_first_pass_transcription(
@@ -1206,6 +1228,9 @@ class SubtitleApp:
                         model_name=model_name,
                         first_whisper_values=first_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(
+                            ("progress", (stage, current, total))
+                        ),
                     )
                 elif mode == "split_chinese":
                     result = extract_chinese_subtitles(
@@ -1219,6 +1244,9 @@ class SubtitleApp:
                         subtitle_a,
                         output,
                         log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(
+                            ("progress", (stage, current, total))
+                        ),
                     )
                 elif mode == "download_mp4":
                     result = download_video_as_mp4(
@@ -1226,6 +1254,9 @@ class SubtitleApp:
                         output,
                         cookie_browser=cookie_browser,
                         log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(
+                            ("progress", (stage, current, total))
+                        ),
                     )
                 else:
                     result = run_two_pass_transcription(
@@ -1238,6 +1269,9 @@ class SubtitleApp:
                         first_whisper_values=first_whisper_values,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(
+                            ("progress", (stage, current, total))
+                        ),
                     )
             self.events.put(("success", (mode, result)))
         except Exception as exc:  # Display full details in log, a concise dialog to the user.
@@ -1253,7 +1287,14 @@ class SubtitleApp:
                 event_type, payload = self.events.get_nowait()
                 processed += 1
                 if event_type == "log":
-                    log_messages.append(str(payload))
+                    message = str(payload)
+                    self._update_progress_from_log(message)
+                    log_messages.append(message)
+                elif event_type == "progress":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
+                    stage, current, total = payload
+                    self._set_progress(str(stage), float(current), float(total))
                 elif event_type == "success":
                     self._append_log_batch(log_messages)
                     log_messages.clear()
@@ -1261,6 +1302,7 @@ class SubtitleApp:
                     self.start_button.configure(state="normal")
                     mode, result = payload
                     self.status.set("处理完成。")
+                    self._finish_progress()
                     self._append_log("全部完成。")
                     if mode == "second_only":
                         messagebox.showinfo(
@@ -1295,6 +1337,7 @@ class SubtitleApp:
                     self.running = False
                     self.start_button.configure(state="normal")
                     self.status.set("处理失败，请查看运行日志。")
+                    self.progress_text.set("处理失败。")
                     self._append_log(f"错误：{payload}")
                     messagebox.showerror("处理失败", str(payload))
         except Empty:
@@ -1317,6 +1360,77 @@ class SubtitleApp:
             self.log.delete("1.0", f"{line_count - 4_000}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
+
+    def _set_progress(self, stage: str, current: float, total: float) -> None:
+        """Render progress events emitted by the pipeline on Tk's main thread."""
+        labels = {
+            "preparing": "正在准备",
+            "subtitle_a": "字幕 A",
+            "subtitle_b": "字幕 B",
+            "download": "视频下载",
+            "burn": "字幕烧录",
+        }
+        self._progress_stage = stage
+        self._progress_total = max(0.0, total)
+        if total <= 0:
+            self.progress_value.set(0)
+            self.progress_text.set(f"{labels.get(stage, '处理中')}：处理中…")
+            return
+        percentage = max(0.0, min(100.0, current / total * 100))
+        self.progress_value.set(percentage)
+        if stage == "subtitle_a":
+            detail = f"{self._format_seconds(current)} / {self._format_seconds(total)}"
+        elif stage == "subtitle_b":
+            detail = f"片段 {int(current)} / {int(total)}"
+        elif stage == "burn":
+            detail = f"帧 {int(current):,} / {int(total):,}"
+        else:
+            detail = f"{percentage:.1f}%"
+        self.progress_text.set(f"{labels.get(stage, '处理中')}：{detail}（{percentage:.1f}%）")
+
+    def _update_progress_from_log(self, message: str) -> None:
+        """Read the native progress formats printed by Whisper, yt-dlp and FFmpeg."""
+        if self._progress_stage == "subtitle_a" and self._progress_total > 0:
+            seconds = self._whisper_timestamp_from_log(message)
+            if seconds is not None:
+                self._set_progress("subtitle_a", seconds, self._progress_total)
+        elif self._progress_stage == "download":
+            match = re.search(r"\[download\]\s+(\d+(?:\.\d+)?)%", message)
+            if match:
+                self._set_progress("download", float(match.group(1)), 100)
+        elif self._progress_stage == "burn" and self._progress_total > 0:
+            match = re.search(r"\bframe=\s*(\d+)", message)
+            if match:
+                self._set_progress("burn", float(match.group(1)), self._progress_total)
+
+    @staticmethod
+    def _whisper_timestamp_from_log(message: str) -> float | None:
+        """Extract a leading Whisper segment timestamp from common verbose formats."""
+        match = re.search(
+            r"(\d+):(\d{2}):(\d{2})[.,](\d{1,3})\s*-->", message
+        )
+        if match:
+            hours, minutes, seconds, milliseconds = (int(value) for value in match.groups())
+            return hours * 3600 + minutes * 60 + seconds + milliseconds / 1000
+        match = re.search(r"(\d+):(\d{2})[.,](\d{1,3})\s*-->", message)
+        if match:
+            minutes, seconds, milliseconds = (int(value) for value in match.groups())
+            return minutes * 60 + seconds + milliseconds / 1000
+        match = re.search(r"\b(\d+(?:\.\d+)?)\s*-->", message)
+        return float(match.group(1)) if match else None
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    def _finish_progress(self) -> None:
+        """Complete the current bar even when the source command lacks final detail."""
+        if self._progress_stage:
+            self.progress_value.set(100)
+            self.progress_text.set("处理完成：100%")
 
     def _open_output_directory(self) -> None:
         destination = Path(self.output_dir.get() or Path.cwd())
