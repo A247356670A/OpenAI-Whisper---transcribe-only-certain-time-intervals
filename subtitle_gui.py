@@ -524,8 +524,13 @@ class SubtitleApp:
             command=self._on_mode_changed,
         ).grid(row=1, column=3, sticky="w", pady=(5, 0))
 
+        # Keep all mode-dependent inputs in one stable container.  Repacking
+        # siblings of the whole window caused stale geometry and click areas
+        # after repeated mode switches on some Windows/Tk combinations.
+        self.input_area = ttk.Frame(self.root)
+        self.input_area.pack(fill="x")
         self.drop_zone = ttk.Label(
-            self.root,
+            self.input_area,
             text="将视频拖到这里\n或点击“选择视频”",
             style="Drop.TLabel",
         )
@@ -534,15 +539,17 @@ class SubtitleApp:
         if TkinterDnD is not None:
             self.drop_zone.drop_target_register(DND_FILES)
             self.drop_zone.dnd_bind("<<Drop>>", self._on_drop)
+            self.drag_hint = None
         else:
-            ttk.Label(
-                self.root,
+            self.drag_hint = ttk.Label(
+                self.input_area,
                 text="提示：安装 requirements.txt 中的 tkinterdnd2 后可使用拖放；当前仍可点击选择文件。",
                 style="Hint.TLabel",
                 wraplength=700,
-            ).pack(anchor="w", pady=(5, 0))
+            )
+            self.drag_hint.pack(anchor="w", pady=(5, 0))
 
-        self.video_row = ttk.Frame(self.root)
+        self.video_row = ttk.Frame(self.input_area)
         self.video_row.pack(fill="x", pady=(14, 7))
         ttk.Label(self.video_row, text="视频文件", width=10).pack(side="left")
         self.video_entry = ttk.Entry(self.video_row, textvariable=self.video_path)
@@ -550,7 +557,7 @@ class SubtitleApp:
         self.video_button = ttk.Button(self.video_row, text="选择视频", command=self._choose_video)
         self.video_button.pack(side="left")
 
-        self.subtitle_row = ttk.Frame(self.root)
+        self.subtitle_row = ttk.Frame(self.input_area)
         self.subtitle_label = ttk.Label(self.subtitle_row, text="翻译字幕 A", width=10)
         self.subtitle_label.pack(side="left")
         self.subtitle_entry = ttk.Entry(
@@ -565,7 +572,7 @@ class SubtitleApp:
             self.subtitle_entry.drop_target_register(DND_FILES)
             self.subtitle_entry.dnd_bind("<<Drop>>", self._on_subtitle_drop)
 
-        self.subtitle_b_row = ttk.Frame(self.root)
+        self.subtitle_b_row = ttk.Frame(self.input_area)
         ttk.Label(self.subtitle_b_row, text="字幕 B", width=10).pack(side="left")
         self.subtitle_b_entry = ttk.Entry(
             self.subtitle_b_row, textvariable=self.subtitle_b_path
@@ -579,7 +586,7 @@ class SubtitleApp:
             self.subtitle_b_entry.drop_target_register(DND_FILES)
             self.subtitle_b_entry.dnd_bind("<<Drop>>", self._on_subtitle_b_drop)
 
-        self.link_row = ttk.Frame(self.root)
+        self.link_row = ttk.Frame(self.input_area)
         ttk.Label(self.link_row, text="视频链接", width=10).pack(side="left")
         self.link_entry = ttk.Entry(self.link_row, textvariable=self.download_link)
         self.link_entry.pack(side="left", fill="x", expand=True)
@@ -660,58 +667,49 @@ class SubtitleApp:
 
     def _on_mode_changed(self) -> None:
         mode = self.run_mode.get()
-        self.link_row.pack_forget()
-        self.subtitle_b_row.pack_forget()
+        self._reset_input_area()
         if mode == "second_only":
-            self.drop_zone.pack(fill="x", before=self.video_row)
-            self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self._show_drop_zone()
+            self.video_row.pack(fill="x", pady=(14, 7))
             self.subtitle_label.configure(text="翻译字幕 A")
             self.subtitle_button.configure(text="选择 SRT")
-            self.subtitle_row.pack(fill="x", pady=7, after=self.video_row)
+            self.subtitle_row.pack(fill="x", pady=7)
             self.drop_zone.configure(text="将视频拖到这里\n补全模式还需要在下方选择或拖入翻译字幕 A")
             self.threshold_entry.configure(state="disabled")
         elif mode == "burn_subtitles":
-            self.drop_zone.pack(fill="x", before=self.video_row)
-            self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self._show_drop_zone()
+            self.video_row.pack(fill="x", pady=(14, 7))
             self.subtitle_label.configure(text="烧录字幕")
             self.subtitle_button.configure(text="选择 SRT")
-            self.subtitle_row.pack(fill="x", pady=7, after=self.video_row)
+            self.subtitle_row.pack(fill="x", pady=7)
             self.drop_zone.configure(text="将视频拖到这里\n然后在下方选择或拖入要烧录的 SRT 字幕")
             self.threshold_entry.configure(state="disabled")
         elif mode == "download_mp4":
-            self.drop_zone.pack_forget()
-            self.subtitle_row.pack_forget()
-            self.video_row.pack_forget()
-            self.link_row.pack(fill="x", pady=(0, 7), before=self.output_row)
+            self.link_row.pack(fill="x", pady=(0, 7))
             self.threshold_entry.configure(state="disabled")
         elif mode == "merge_subtitles":
-            self.drop_zone.pack_forget()
-            self.video_row.pack_forget()
             self.subtitle_label.configure(text="字幕 A")
             self.subtitle_button.configure(text="选择 SRT")
-            self.subtitle_b_row.pack(fill="x", pady=(0, 7), before=self.output_row)
-            self.subtitle_row.pack(fill="x", pady=(0, 7), before=self.subtitle_b_row)
+            self.subtitle_row.pack(fill="x", pady=(0, 7))
+            self.subtitle_b_row.pack(fill="x", pady=(0, 7))
             self.threshold_entry.configure(state="disabled")
         elif mode == "hallucination_cleanup":
-            self.drop_zone.pack(fill="x", before=self.subtitle_row)
-            self.video_row.pack_forget()
+            self._show_drop_zone()
             self.subtitle_label.configure(text="字幕文件")
             self.subtitle_button.configure(text="添加字幕")
-            self.subtitle_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self.subtitle_row.pack(fill="x", pady=(14, 7))
             self.drop_zone.configure(text="将要审核的 SRT 字幕拖到这里\n或在下方点击“添加字幕”")
             self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
-            self.drop_zone.pack(fill="x", before=self.subtitle_row)
-            self.video_row.pack_forget()
+            self._show_drop_zone()
             self.subtitle_label.configure(text="中日双语字幕")
             self.subtitle_button.configure(text="选择 SRT")
-            self.subtitle_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self.subtitle_row.pack(fill="x", pady=(14, 7))
             self.drop_zone.configure(text="将中日双语 SRT 拖到这里\n或在下方点击“选择 SRT”")
             self.threshold_entry.configure(state="disabled")
         else:
-            self.drop_zone.pack(fill="x", before=self.video_row)
-            self.subtitle_row.pack_forget()
-            self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self._show_drop_zone()
+            self.video_row.pack(fill="x", pady=(14, 7))
             if mode == "first_only":
                 self.drop_zone.configure(text="将视频拖到这里\n仅生成第一轮字幕 A")
                 self.threshold_entry.configure(state="disabled")
@@ -725,6 +723,25 @@ class SubtitleApp:
         }
         self.start_button.configure(text=start_labels.get(mode, "开始提取字幕"))
         self._update_preview()
+
+    def _reset_input_area(self) -> None:
+        """Remove every mode-specific widget before rebuilding the input order."""
+        for widget in (
+            self.drop_zone,
+            self.video_row,
+            self.subtitle_row,
+            self.subtitle_b_row,
+            self.link_row,
+        ):
+            widget.pack_forget()
+        if self.drag_hint is not None:
+            self.drag_hint.pack_forget()
+
+    def _show_drop_zone(self) -> None:
+        """Display the drop target and its optional drag-and-drop availability hint."""
+        self.drop_zone.pack(fill="x")
+        if self.drag_hint is not None:
+            self.drag_hint.pack(anchor="w", pady=(5, 0))
 
     def _choose_video(self) -> None:
         path = filedialog.askopenfilename(title="选择视频或音频文件", filetypes=VIDEO_FILE_TYPES)
@@ -1189,12 +1206,19 @@ class SubtitleApp:
             self.events.put(("error", str(exc)))
 
     def _consume_events(self) -> None:
+        log_messages: list[str] = []
+        processed = 0
         try:
-            while True:
+            # Do not drain an endlessly growing FFmpeg/Whisper log queue in one
+            # Tk callback: that starves click and repaint events on busy runs.
+            while processed < 80:
                 event_type, payload = self.events.get_nowait()
+                processed += 1
                 if event_type == "log":
-                    self._append_log(str(payload))
+                    log_messages.append(str(payload))
                 elif event_type == "success":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
                     self.running = False
                     self.start_button.configure(state="normal")
                     mode, result = payload
@@ -1228,6 +1252,8 @@ class SubtitleApp:
                             "字幕已生成", f"合并字幕已保存到：\n{result.merged}"
                         )
                 elif event_type == "error":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
                     self.running = False
                     self.start_button.configure(state="normal")
                     self.status.set("处理失败，请查看运行日志。")
@@ -1235,11 +1261,22 @@ class SubtitleApp:
                     messagebox.showerror("处理失败", str(payload))
         except Empty:
             pass
-        self.root.after(120, self._consume_events)
+        self._append_log_batch(log_messages)
+        # Continue quickly while there is a backlog, but remain light when idle.
+        self.root.after(30 if processed == 80 else 120, self._consume_events)
 
     def _append_log(self, message: str) -> None:
+        self._append_log_batch([message])
+
+    def _append_log_batch(self, messages: list[str]) -> None:
+        """Append a bounded batch so heavy worker output cannot freeze Tk."""
+        if not messages:
+            return
         self.log.configure(state="normal")
-        self.log.insert("end", message + "\n")
+        self.log.insert("end", "".join(message + "\n" for message in messages))
+        line_count = int(self.log.index("end-1c").split(".")[0])
+        if line_count > 4_000:
+            self.log.delete("1.0", f"{line_count - 4_000}.0")
         self.log.see("end")
         self.log.configure(state="disabled")
 

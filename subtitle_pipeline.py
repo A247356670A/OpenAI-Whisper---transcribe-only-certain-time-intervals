@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import os
 from typing import Any, Callable, Mapping
 from SrtMerge import (
     merge_srt,
@@ -216,6 +217,18 @@ def _import_dependencies():
     return librosa, torch, whisper
 
 
+def _reserve_cpu_for_gui(torch: Any) -> None:
+    """Avoid letting CPU-only Whisper consume every core needed by Tk."""
+    cpu_count = os.cpu_count() or 1
+    if cpu_count < 2:
+        return
+    try:
+        torch.set_num_threads(max(1, cpu_count - 1))
+    except (AttributeError, RuntimeError):
+        # Some Torch builds do not allow changing this after initialization.
+        pass
+
+
 def filter_silent_b_segments(
     audio_segments: list[list[Any]],
     sample_rate: int,
@@ -293,6 +306,8 @@ def run_two_pass_transcription(
 
     librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        _reserve_cpu_for_gui(torch)
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
 
@@ -376,6 +391,8 @@ def run_first_pass_transcription(
 
     _librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        _reserve_cpu_for_gui(torch)
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
     first_options = build_whisper_options(
@@ -430,6 +447,8 @@ def run_second_pass_from_subtitle(
 
     librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        _reserve_cpu_for_gui(torch)
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
     second_options = build_whisper_options(
