@@ -8,3 +8,6 @@ tkinterdnd2
 
 # Link-based MP4 downloads in the GUI
 yt-dlp
+
+# Optional dialogue detection for B audio pre-filtering
+webrtcvad-wheels

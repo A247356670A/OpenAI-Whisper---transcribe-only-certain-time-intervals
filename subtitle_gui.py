@@ -52,6 +52,14 @@ VIDEO_FILE_TYPES = [
     ("所有文件", "*.*"),
 ]
 
+B_AUDIO_FILTER_PRESETS = {
+    "仅跳过完全静音（推荐）": ("0.0001", "0.05", "45"),
+    "平衡": ("0.001", "0.25", "35"),
+    "强过滤": ("0.003", "0.50", "25"),
+    "自定义": None,
+}
+VAD_AGGRESSIVENESS = {"宽松": 1, "平衡": 2, "严格": 3}
+
 
 def enable_high_dpi_awareness() -> None:
     """Ask Windows to render the Tk window at the monitor's native DPI."""
@@ -411,6 +419,12 @@ class SubtitleApp:
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
         self.filter_silent_b = tk.BooleanVar(value=True)
+        self.b_audio_preset = tk.StringVar(value="仅跳过完全静音（推荐）")
+        self.b_audio_min_rms = tk.StringVar(value="0.0001")
+        self.b_audio_min_active_seconds = tk.StringVar(value="0.05")
+        self.b_audio_silence_top_db = tk.StringVar(value="45")
+        self.b_speech_only = tk.BooleanVar(value=False)
+        self.b_vad_strength = tk.StringVar(value="平衡")
         self.burn_font_name = tk.StringVar(value="微软雅黑")
         self.burn_font_color = tk.StringVar(value="白色")
         self.burn_font_size = tk.StringVar(value="16")
@@ -632,14 +646,49 @@ class SubtitleApp:
         self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
         ttk.Checkbutton(
             options,
-            text="B 静音预筛（跳过近似静音片段，默认开启）",
+            text="B 音频预筛（默认只跳过完全静音）",
             variable=self.filter_silent_b,
-        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(options, text="预设").grid(row=1, column=2, sticky="e", padx=(14, 0), pady=(8, 0))
+        self.b_audio_preset_box = ttk.Combobox(
+            options,
+            state="readonly",
+            textvariable=self.b_audio_preset,
+            values=tuple(B_AUDIO_FILTER_PRESETS),
+            width=20,
+        )
+        self.b_audio_preset_box.grid(row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0))
+        self.b_audio_preset_box.bind("<<ComboboxSelected>>", self._apply_b_audio_preset)
         ttk.Button(
             options,
             text="第一/二轮 Whisper 高级参数…",
             command=self._show_whisper_options,
-        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(26, 0), pady=(8, 0))
+        ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        ttk.Label(options, text="RMS 下限").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(options, textvariable=self.b_audio_min_rms, width=8).grid(
+            row=2, column=1, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        ttk.Label(options, text="最少有效音频（秒）").grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(options, textvariable=self.b_audio_min_active_seconds, width=8).grid(
+            row=2, column=3, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        ttk.Label(options, text="静音判定 dB").grid(row=2, column=4, sticky="w", pady=(8, 0))
+        ttk.Entry(options, textvariable=self.b_audio_silence_top_db, width=6).grid(
+            row=2, column=5, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        ttk.Checkbutton(
+            options,
+            text="语音优先（跳过未检测到对白的 B 片段，实验性）",
+            variable=self.b_speech_only,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(options, text="语音检测强度").grid(row=3, column=3, sticky="e", pady=(8, 0))
+        ttk.Combobox(
+            options,
+            state="readonly",
+            textvariable=self.b_vad_strength,
+            values=tuple(VAD_AGGRESSIVENESS),
+            width=8,
+        ).grid(row=3, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
 
         self.burn_style_frame = ttk.LabelFrame(
             self.root, text="烧录字幕样式", padding=(10, 7)
@@ -791,6 +840,16 @@ class SubtitleApp:
         }
         self.start_button.configure(text=start_labels.get(mode, "开始提取字幕"))
         self._update_preview()
+
+    def _apply_b_audio_preset(self, _event=None) -> None:
+        """Fill the editable B audio gate fields from a user-selected preset."""
+        values = B_AUDIO_FILTER_PRESETS.get(self.b_audio_preset.get())
+        if values is None:
+            return
+        rms, active_seconds, top_db = values
+        self.b_audio_min_rms.set(rms)
+        self.b_audio_min_active_seconds.set(active_seconds)
+        self.b_audio_silence_top_db.set(top_db)
 
     def _reset_input_area(self) -> None:
         """Remove every mode-specific widget before rebuilding the input order."""
@@ -1215,6 +1274,27 @@ class SubtitleApp:
                 messagebox.showwarning("设置不正确", "合并间隔和去重阈值必须是大于或等于 0 的数字。")
                 return
 
+        b_audio_min_rms, b_audio_min_active_seconds, b_audio_silence_top_db = 0.0001, 0.05, 45
+        b_speech_only = self.b_speech_only.get()
+        vad_aggressiveness = VAD_AGGRESSIVENESS[self.b_vad_strength.get()]
+        if mode in ("full", "second_only") and self.filter_silent_b.get():
+            try:
+                b_audio_min_rms = float(self.b_audio_min_rms.get())
+                b_audio_min_active_seconds = float(self.b_audio_min_active_seconds.get())
+                b_audio_silence_top_db = int(self.b_audio_silence_top_db.get())
+                if (
+                    b_audio_min_rms < 0
+                    or b_audio_min_active_seconds < 0
+                    or not 1 <= b_audio_silence_top_db <= 100
+                ):
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(
+                    "B 音频预筛设置不正确",
+                    "RMS 和有效音频时长必须不小于 0；静音判定 dB 必须在 1 到 100 之间。",
+                )
+                return
+
         if mode == "split_chinese":
             split_output = build_chinese_only_path(subtitle_a, output)
             existing = [split_output.name] if split_output.exists() else []
@@ -1294,6 +1374,11 @@ class SubtitleApp:
                 merge_gap,
                 duplicate_threshold,
                 self.filter_silent_b.get(),
+                b_audio_min_rms,
+                b_audio_min_active_seconds,
+                b_audio_silence_top_db,
+                b_speech_only,
+                vad_aggressiveness,
                 font_name,
                 font_size,
                 font_color,
@@ -1379,6 +1464,11 @@ class SubtitleApp:
         merge_gap: float,
         duplicate_threshold: float,
         filter_silent_b: bool,
+        b_audio_min_rms: float,
+        b_audio_min_active_seconds: float,
+        b_audio_silence_top_db: int,
+        b_speech_only: bool,
+        vad_aggressiveness: int,
         font_name: str,
         font_size: int,
         font_color: str,
@@ -1398,6 +1488,11 @@ class SubtitleApp:
                         model_name=model_name,
                         merge_gap=merge_gap,
                         filter_silent_b=filter_silent_b,
+                        b_audio_min_rms=b_audio_min_rms,
+                        b_audio_min_active_seconds=b_audio_min_active_seconds,
+                        b_audio_silence_top_db=b_audio_silence_top_db,
+                        b_speech_only=b_speech_only,
+                        b_vad_aggressiveness=vad_aggressiveness,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
                         progress_callback=lambda stage, current, total: self.events.put(
@@ -1453,6 +1548,11 @@ class SubtitleApp:
                         merge_gap=merge_gap,
                         duplicate_threshold=duplicate_threshold,
                         filter_silent_b=filter_silent_b,
+                        b_audio_min_rms=b_audio_min_rms,
+                        b_audio_min_active_seconds=b_audio_min_active_seconds,
+                        b_audio_silence_top_db=b_audio_silence_top_db,
+                        b_speech_only=b_speech_only,
+                        b_vad_aggressiveness=vad_aggressiveness,
                         first_whisper_values=first_whisper_values,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),

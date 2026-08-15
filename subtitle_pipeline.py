@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import os
@@ -31,11 +32,12 @@ LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[str, float, float], None]
 
 
-# Conservative B-pass audio gate: only near-silent gaps are skipped.  Spoken
-# dialogue and music are deliberately retained for Whisper to avoid omissions.
-B_AUDIO_MIN_RMS = 0.001
-B_AUDIO_MIN_ACTIVE_SECONDS = 0.25
-B_AUDIO_SILENCE_TOP_DB = 35
+# Conservative B-pass audio gate.  The defaults intentionally reject only
+# near-digital silence, so quiet dialogue is not lost before Whisper sees it.
+B_AUDIO_MIN_RMS = 0.0001
+B_AUDIO_MIN_ACTIVE_SECONDS = 0.05
+B_AUDIO_SILENCE_TOP_DB = 45
+B_VAD_MIN_SPEECH_SECONDS = 0.09
 
 
 @dataclass(frozen=True)
@@ -367,16 +369,26 @@ def filter_silent_b_segments(
     audio_segments: list[list[Any]],
     sample_rate: int,
     librosa: Any,
+    *,
+    min_rms: float = B_AUDIO_MIN_RMS,
+    min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
+    silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
+    speech_only: bool = False,
+    vad_aggressiveness: int = 2,
 ) -> tuple[list[list[Any]], list[tuple[float, float]]]:
     """Keep B candidate slices that contain meaningful non-silent audio.
 
     ``librosa.effects.split`` identifies active portions relative to the
     segment's volume; RMS adds an absolute floor so digital silence is not
-    mistaken for audio.  This intentionally does not try to remove BGM,
-    because a simple volume gate cannot distinguish it safely from dialogue.
+    mistaken for audio.  If ``speech_only`` is requested, WebRTC VAD is used
+    after the volume test to prefer detected dialogue over music or ambience.
     """
     kept_segments: list[list[Any]] = []
     skipped_intervals: list[tuple[float, float]] = []
+    if min_rms < 0 or min_active_seconds < 0 or not 1 <= silence_top_db <= 100:
+        raise ValueError("B 音频预筛阈值无效。")
+    if not 0 <= vad_aggressiveness <= 3:
+        raise ValueError("语音检测强度必须在 0 到 3 之间。")
     for start, end, samples in audio_segments:
         if len(samples) == 0:
             skipped_intervals.append((float(start), float(end)))
@@ -388,17 +400,49 @@ def filter_silent_b_segments(
             # Keep the helper import-safe for lightweight test and GUI setups.
             rms = (sum(float(sample) ** 2 for sample in samples) / len(samples)) ** 0.5
         active_ranges = librosa.effects.split(
-            samples, top_db=B_AUDIO_SILENCE_TOP_DB
+            samples, top_db=silence_top_db
         )
         active_seconds = sum(
             (int(range_end) - int(range_start)) / sample_rate
             for range_start, range_end in active_ranges
         )
-        if rms < B_AUDIO_MIN_RMS or active_seconds < B_AUDIO_MIN_ACTIVE_SECONDS:
+        if rms < min_rms or active_seconds < min_active_seconds:
+            skipped_intervals.append((float(start), float(end)))
+        elif speech_only and _measure_speech_seconds(
+            samples, sample_rate, vad_aggressiveness
+        ) < B_VAD_MIN_SPEECH_SECONDS:
             skipped_intervals.append((float(start), float(end)))
         else:
             kept_segments.append([start, end, samples])
     return kept_segments, skipped_intervals
+
+
+def _measure_speech_seconds(
+    samples: Any, sample_rate: int, aggressiveness: int
+) -> float:
+    """Estimate voiced time with WebRTC VAD without loading another ML model."""
+    if sample_rate not in (8_000, 16_000, 32_000, 48_000):
+        raise ValueError("语音检测仅支持 8/16/32/48 kHz 单声道音频。")
+    try:
+        import webrtcvad
+    except ImportError as exc:
+        raise RuntimeError(
+            "语音优先检测需要 webrtcvad-wheels。请在项目目录重新执行：\n"
+            "python -m pip install -r requirements.txt"
+        ) from exc
+
+    frame_samples = sample_rate * 30 // 1000
+    vad = webrtcvad.Vad(aggressiveness)
+    speech_seconds = 0.0
+    for offset in range(0, len(samples) - frame_samples + 1, frame_samples):
+        frame = samples[offset : offset + frame_samples]
+        pcm = struct.pack(
+            f"<{frame_samples}h",
+            *(int(max(-1.0, min(1.0, float(value))) * 32767) for value in frame),
+        )
+        if vad.is_speech(pcm, sample_rate):
+            speech_seconds += 0.03
+    return speech_seconds
 
 
 def run_two_pass_transcription(
@@ -409,6 +453,11 @@ def run_two_pass_transcription(
     merge_gap: float = 1.0,
     duplicate_threshold: float = 0.5,
     filter_silent_b: bool = True,
+    b_audio_min_rms: float = B_AUDIO_MIN_RMS,
+    b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
+    b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
+    b_speech_only: bool = False,
+    b_vad_aggressiveness: int = 2,
     first_whisper_values: Mapping[str, Any] | None = None,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
@@ -473,12 +522,21 @@ def run_two_pass_transcription(
 
     if filter_silent_b and audio_segments:
         audio_segments, skipped_intervals = filter_silent_b_segments(
-            audio_segments, sample_rate, librosa
+            audio_segments,
+            sample_rate,
+            librosa,
+            min_rms=b_audio_min_rms,
+            min_active_seconds=b_audio_min_active_seconds,
+            silence_top_db=b_audio_silence_top_db,
+            speech_only=b_speech_only,
+            vad_aggressiveness=b_vad_aggressiveness,
         )
         if skipped_intervals:
             _log(
                 log_callback,
-                f"B 音频预筛：跳过 {len(skipped_intervals)} 个近似静音的未覆盖片段。",
+                f"B 音频预筛：跳过 {len(skipped_intervals)} 个未覆盖片段"
+                f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
+                + ("，语音优先已开启）。" if b_speech_only else "）。"),
             )
 
     if audio_segments:
@@ -565,6 +623,11 @@ def run_second_pass_from_subtitle(
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
     filter_silent_b: bool = True,
+    b_audio_min_rms: float = B_AUDIO_MIN_RMS,
+    b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
+    b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
+    b_speech_only: bool = False,
+    b_vad_aggressiveness: int = 2,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -618,12 +681,21 @@ def run_second_pass_from_subtitle(
 
     if filter_silent_b and audio_segments:
         audio_segments, skipped_intervals = filter_silent_b_segments(
-            audio_segments, sample_rate, librosa
+            audio_segments,
+            sample_rate,
+            librosa,
+            min_rms=b_audio_min_rms,
+            min_active_seconds=b_audio_min_active_seconds,
+            silence_top_db=b_audio_silence_top_db,
+            speech_only=b_speech_only,
+            vad_aggressiveness=b_vad_aggressiveness,
         )
         if skipped_intervals:
             _log(
                 log_callback,
-                f"B 音频预筛：跳过 {len(skipped_intervals)} 个近似静音的未覆盖片段。",
+                f"B 音频预筛：跳过 {len(skipped_intervals)} 个未覆盖片段"
+                f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
+                + ("，语音优先已开启）。" if b_speech_only else "）。"),
             )
 
     if audio_segments:
