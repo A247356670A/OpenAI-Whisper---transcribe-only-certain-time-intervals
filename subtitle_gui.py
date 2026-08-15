@@ -16,10 +16,15 @@ from subtitle_pipeline import (
     build_output_paths,
     build_chinese_only_path,
     build_burned_video_path,
+    build_manual_merge_path,
     build_second_pass_path,
     burn_subtitles_to_mp4,
+    complete_manual_subtitle_merge,
     download_video_as_mp4,
     extract_chinese_subtitles,
+    format_srt_entries,
+    parse_editable_srt_text,
+    prepare_manual_subtitle_merge,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
@@ -173,6 +178,107 @@ class WhisperOptionsDialog:
             values[key].set(value)
 
 
+class SubtitleConflictDialog:
+    """Let the user choose or edit one side of every overlapping subtitle group."""
+
+    def __init__(self, parent: tk.Tk, prepared, on_complete) -> None:
+        self.prepared = prepared
+        self.on_complete = on_complete
+        self.editors: list[tuple[tk.StringVar, tk.Text, tk.Text]] = []
+        self.window = tk.Toplevel(parent)
+        self.window.title("处理字幕时间轴冲突")
+        self.window.geometry("1480x840")
+        self.window.minsize(1060, 650)
+        self.window.transient(parent)
+        self.window.configure(padx=14, pady=12)
+
+        ttk.Label(
+            self.window,
+            text=(
+                f"发现 {len(prepared.conflicts)} 组时间轴冲突。每组请选择保留 A 或 B；"
+                "两侧内容均可直接编辑（请保留标准 SRT 时间轴格式）。"
+            ),
+            style="Hint.TLabel",
+            wraplength=1400,
+        ).pack(anchor="w", pady=(0, 9))
+
+        holder = ttk.Frame(self.window)
+        holder.pack(fill="both", expand=True)
+        canvas = tk.Canvas(holder, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        content = ttk.Frame(canvas)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        content.columnconfigure(0, weight=1)
+
+        for index, conflict in enumerate(prepared.conflicts, start=1):
+            self._add_conflict_card(content, index, conflict)
+
+        content.bind(
+            "<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda event: canvas.itemconfigure(content_window, width=event.width)
+        )
+
+        buttons = ttk.Frame(self.window)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right")
+        ttk.Button(buttons, text="生成合并字幕", command=self._save).pack(side="right", padx=(0, 8))
+
+    def _add_conflict_card(self, parent: ttk.Frame, index: int, conflict) -> None:
+        card = ttk.LabelFrame(parent, text=f"冲突 {index}", padding=8)
+        card.grid(row=index - 1, column=0, sticky="ew", pady=(0, 8))
+        card.columnconfigure(0, weight=1)
+        card.columnconfigure(1, weight=1)
+        selected_side = tk.StringVar(value="a")
+
+        a_header = ttk.Frame(card)
+        a_header.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Radiobutton(
+            a_header,
+            text=f"保留字幕 A（{len(conflict.a_entries)} 条，可编辑）",
+            value="a",
+            variable=selected_side,
+        ).pack(anchor="w")
+        b_header = ttk.Frame(card)
+        b_header.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ttk.Radiobutton(
+            b_header,
+            text=f"保留字幕 B（{len(conflict.b_entries)} 条，可编辑）",
+            value="b",
+            variable=selected_side,
+        ).pack(anchor="w")
+
+        height = max(4, min(12, max(len(conflict.a_entries), len(conflict.b_entries)) * 4))
+        a_text = tk.Text(card, height=height, wrap="word")
+        b_text = tk.Text(card, height=height, wrap="word")
+        a_text.insert("1.0", format_srt_entries(conflict.a_entries))
+        b_text.insert("1.0", format_srt_entries(conflict.b_entries))
+        a_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(5, 0))
+        b_text.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(5, 0))
+        self.editors.append((selected_side, a_text, b_text))
+
+    def _save(self) -> None:
+        selected_entries = []
+        try:
+            for index, (selected_side, a_text, b_text) in enumerate(self.editors, start=1):
+                chosen_text = (
+                    a_text.get("1.0", "end-1c")
+                    if selected_side.get() == "a"
+                    else b_text.get("1.0", "end-1c")
+                )
+                selected_entries.append(parse_editable_srt_text(chosen_text))
+            result = complete_manual_subtitle_merge(self.prepared, selected_entries)
+        except ValueError as exc:
+            messagebox.showerror("无法生成字幕", f"冲突 {len(selected_entries) + 1}：{exc}", parent=self.window)
+            return
+        self.window.destroy()
+        self.on_complete(result)
+
+
 class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -185,6 +291,7 @@ class SubtitleApp:
         self.running = False
         self.video_path = tk.StringVar()
         self.subtitle_a_path = tk.StringVar()
+        self.subtitle_b_path = tk.StringVar()
         self.download_link = tk.StringVar()
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
@@ -250,7 +357,7 @@ class SubtitleApp:
 
         mode_frame = ttk.LabelFrame(self.root, text="选择功能", padding=(10, 7))
         mode_frame.pack(fill="x", pady=(0, 9))
-        for column in range(3):
+        for column in range(4):
             mode_frame.columnconfigure(column, weight=1)
         ttk.Radiobutton(
             mode_frame,
@@ -272,7 +379,14 @@ class SubtitleApp:
             value="second_only",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=0, column=2, sticky="w")
+        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ttk.Radiobutton(
+            mode_frame,
+            text="合并字幕 A+B：逐项处理时间轴冲突",
+            value="merge_subtitles",
+            variable=self.run_mode,
+            command=self._on_mode_changed,
+        ).grid(row=0, column=3, sticky="w")
         ttk.Radiobutton(
             mode_frame,
             text="字幕拆分：中日双语字幕 → 仅中文字幕",
@@ -293,7 +407,7 @@ class SubtitleApp:
             value="download_mp4",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=1, column=2, sticky="w", pady=(5, 0))
+        ).grid(row=1, column=2, sticky="w", padx=(0, 12), pady=(5, 0))
 
         self.drop_zone = ttk.Label(
             self.root,
@@ -336,17 +450,31 @@ class SubtitleApp:
             self.subtitle_entry.drop_target_register(DND_FILES)
             self.subtitle_entry.dnd_bind("<<Drop>>", self._on_subtitle_drop)
 
+        self.subtitle_b_row = ttk.Frame(self.root)
+        ttk.Label(self.subtitle_b_row, text="字幕 B", width=10).pack(side="left")
+        self.subtitle_b_entry = ttk.Entry(
+            self.subtitle_b_row, textvariable=self.subtitle_b_path
+        )
+        self.subtitle_b_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.subtitle_b_button = ttk.Button(
+            self.subtitle_b_row, text="选择 SRT", command=self._choose_subtitle_b
+        )
+        self.subtitle_b_button.pack(side="left")
+        if TkinterDnD is not None:
+            self.subtitle_b_entry.drop_target_register(DND_FILES)
+            self.subtitle_b_entry.dnd_bind("<<Drop>>", self._on_subtitle_b_drop)
+
         self.link_row = ttk.Frame(self.root)
         ttk.Label(self.link_row, text="视频链接", width=10).pack(side="left")
         self.link_entry = ttk.Entry(self.link_row, textvariable=self.download_link)
         self.link_entry.pack(side="left", fill="x", expand=True)
 
-        output_row = ttk.Frame(self.root)
-        output_row.pack(fill="x", pady=7)
-        ttk.Label(output_row, text="保存位置", width=10).pack(side="left")
-        self.output_entry = ttk.Entry(output_row, textvariable=self.output_dir)
+        self.output_row = ttk.Frame(self.root)
+        self.output_row.pack(fill="x", pady=7)
+        ttk.Label(self.output_row, text="保存位置", width=10).pack(side="left")
+        self.output_entry = ttk.Entry(self.output_row, textvariable=self.output_dir)
         self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.output_button = ttk.Button(output_row, text="选择文件夹", command=self._choose_output_dir)
+        self.output_button = ttk.Button(self.output_row, text="选择文件夹", command=self._choose_output_dir)
         self.output_button.pack(side="left")
 
         options = ttk.LabelFrame(self.root, text="处理设置", padding=(10, 7))
@@ -412,7 +540,10 @@ class SubtitleApp:
 
     def _on_mode_changed(self) -> None:
         mode = self.run_mode.get()
+        self.link_row.pack_forget()
+        self.subtitle_b_row.pack_forget()
         if mode == "second_only":
+            self.drop_zone.pack(fill="x", before=self.video_row)
             self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
             self.subtitle_label.configure(text="翻译字幕 A")
             self.subtitle_button.configure(text="选择 SRT")
@@ -420,6 +551,7 @@ class SubtitleApp:
             self.drop_zone.configure(text="将视频拖到这里\n补全模式还需要在下方选择或拖入翻译字幕 A")
             self.threshold_entry.configure(state="disabled")
         elif mode == "burn_subtitles":
+            self.drop_zone.pack(fill="x", before=self.video_row)
             self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
             self.subtitle_label.configure(text="烧录字幕")
             self.subtitle_button.configure(text="选择 SRT")
@@ -430,10 +562,17 @@ class SubtitleApp:
             self.drop_zone.pack_forget()
             self.subtitle_row.pack_forget()
             self.video_row.pack_forget()
-            self.link_row.pack(fill="x", pady=(0, 7), before=self.output_entry.master)
+            self.link_row.pack(fill="x", pady=(0, 7), before=self.output_row)
+            self.threshold_entry.configure(state="disabled")
+        elif mode == "merge_subtitles":
+            self.drop_zone.pack_forget()
+            self.video_row.pack_forget()
+            self.subtitle_label.configure(text="字幕 A")
+            self.subtitle_button.configure(text="选择 SRT")
+            self.subtitle_b_row.pack(fill="x", pady=(0, 7), before=self.output_row)
+            self.subtitle_row.pack(fill="x", pady=(0, 7), before=self.subtitle_b_row)
             self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
-            self.link_row.pack_forget()
             self.drop_zone.pack(fill="x", before=self.subtitle_row)
             self.video_row.pack_forget()
             self.subtitle_label.configure(text="中日双语字幕")
@@ -442,7 +581,6 @@ class SubtitleApp:
             self.drop_zone.configure(text="将中日双语 SRT 拖到这里\n或在下方点击“选择 SRT”")
             self.threshold_entry.configure(state="disabled")
         else:
-            self.link_row.pack_forget()
             self.drop_zone.pack(fill="x", before=self.video_row)
             self.subtitle_row.pack_forget()
             self.video_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
@@ -472,6 +610,11 @@ class SubtitleApp:
         if paths:
             self._set_subtitle_a(paths[0])
 
+    def _on_subtitle_b_drop(self, event) -> None:
+        paths = self.root.tk.splitlist(event.data)
+        if paths:
+            self._set_subtitle_b(paths[0])
+
     def _set_video(self, path: str) -> None:
         video = Path(path).expanduser()
         if not video.is_file():
@@ -490,14 +633,30 @@ class SubtitleApp:
         if path:
             self._set_subtitle_a(path)
 
+    def _choose_subtitle_b(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择字幕 B",
+            filetypes=[("SRT 字幕", "*.srt"), ("所有文件", "*.*")],
+        )
+        if path:
+            self._set_subtitle_b(path)
+
     def _set_subtitle_a(self, path: str) -> None:
         subtitle = Path(path).expanduser()
         if not subtitle.is_file() or subtitle.suffix.lower() != ".srt":
             messagebox.showerror("无法读取字幕", "请选择一个有效的 .srt 字幕文件。")
             return
         self.subtitle_a_path.set(str(subtitle.resolve()))
-        if self.run_mode.get() == "split_chinese" and not self.output_dir.get():
+        if self.run_mode.get() in ("split_chinese", "merge_subtitles") and not self.output_dir.get():
             self.output_dir.set(str(subtitle.parent.resolve()))
+        self._update_preview()
+
+    def _set_subtitle_b(self, path: str) -> None:
+        subtitle = Path(path).expanduser()
+        if not subtitle.is_file() or subtitle.suffix.lower() != ".srt":
+            messagebox.showerror("无法读取字幕", "请选择一个有效的 .srt 字幕文件。")
+            return
+        self.subtitle_b_path.set(str(subtitle.resolve()))
         self._update_preview()
 
     def _choose_output_dir(self) -> None:
@@ -509,6 +668,21 @@ class SubtitleApp:
 
     def _update_preview(self) -> None:
         mode = self.run_mode.get()
+        if mode == "merge_subtitles":
+            if not self.subtitle_a_path.get() or not self.subtitle_b_path.get():
+                self.output_preview.set("合并字幕模式：请分别选择字幕 A 和字幕 B。")
+                return
+            output_dir = self.output_dir.get() or str(Path(self.subtitle_a_path.get()).parent)
+            merged_path = build_manual_merge_path(
+                self.subtitle_a_path.get(), self.subtitle_b_path.get(), output_dir
+            )
+            self.output_preview.set(
+                f"字幕 A（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
+                f"字幕 B（不会修改）：{Path(self.subtitle_b_path.get()).name}\n"
+                f"合并输出：{merged_path.name}\n"
+                "时间轴重叠部分将在下一窗口中选择保留 A、保留 B 或直接编辑。"
+            )
+            return
         if mode == "download_mp4":
             if not self.download_link.get().strip():
                 self.output_preview.set("下载 MP4 模式：请输入视频链接。")
@@ -591,10 +765,11 @@ class SubtitleApp:
             return
         video = self.video_path.get().strip()
         subtitle_a = self.subtitle_a_path.get().strip()
+        subtitle_b = self.subtitle_b_path.get().strip()
         download_link = self.download_link.get().strip()
         output = self.output_dir.get().strip()
         mode = self.run_mode.get()
-        if mode not in ("split_chinese", "download_mp4") and not video:
+        if mode not in ("split_chinese", "download_mp4", "merge_subtitles") and not video:
             messagebox.showwarning("请选择视频", "请拖入视频文件，或点击“选择视频”。")
             return
         if mode == "download_mp4" and not download_link:
@@ -602,6 +777,9 @@ class SubtitleApp:
             return
         if not output and mode != "split_chinese":
             messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
+            return
+        if mode == "merge_subtitles" and (not subtitle_a or not subtitle_b):
+            messagebox.showwarning("请选择字幕", "请分别选择字幕 A 和字幕 B（.srt）。")
             return
         if mode in ("second_only", "split_chinese", "burn_subtitles") and not subtitle_a:
             required_name = {
@@ -614,7 +792,7 @@ class SubtitleApp:
         if mode == "split_chinese" and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
-        if mode in ("split_chinese", "burn_subtitles", "download_mp4"):
+        if mode in ("split_chinese", "burn_subtitles", "download_mp4", "merge_subtitles"):
             merge_gap, duplicate_threshold = 1.0, 0.5
         else:
             try:
@@ -634,6 +812,9 @@ class SubtitleApp:
             existing = [burned_video.name] if burned_video.exists() else []
         elif mode == "download_mp4":
             existing = []
+        elif mode == "merge_subtitles":
+            merged_path = build_manual_merge_path(subtitle_a, subtitle_b, output)
+            existing = [merged_path.name] if merged_path.exists() else []
         elif mode == "second_only":
             existing = [
                 build_second_pass_path(subtitle_a, output).name
@@ -654,6 +835,10 @@ class SubtitleApp:
         if existing and not messagebox.askyesno(
             "确认覆盖", "以下文件已存在，继续会覆盖它们：\n\n" + "\n".join(existing)
         ):
+            return
+
+        if mode == "merge_subtitles":
+            self._start_manual_subtitle_merge(subtitle_a, subtitle_b, output)
             return
 
         self.running = True
@@ -687,6 +872,32 @@ class SubtitleApp:
             daemon=True,
         )
         worker.start()
+
+    def _start_manual_subtitle_merge(
+        self, subtitle_a: str, subtitle_b: str, output: str
+    ) -> None:
+        """Prepare lightweight SRT conflict data, then open the review dialog."""
+        try:
+            prepared = prepare_manual_subtitle_merge(subtitle_a, subtitle_b, output)
+            self._append_log("开始处理：合并字幕 A+B")
+            if prepared.conflicts:
+                SubtitleConflictDialog(self.root, prepared, self._manual_merge_completed)
+                return
+            result = complete_manual_subtitle_merge(prepared, [])
+        except (OSError, ValueError) as exc:
+            self.status.set("处理失败，请检查字幕文件。")
+            self._append_log(f"错误：{exc}")
+            messagebox.showerror("处理失败", str(exc))
+            return
+        self._manual_merge_completed(result)
+
+    def _manual_merge_completed(self, result) -> None:
+        """Display the same completion feedback for automatic and reviewed merges."""
+        self.status.set("处理完成。")
+        self._append_log(
+            f"完成：已合并字幕 A+B（处理 {result.conflict_count} 组时间轴冲突）：{result.output_path}"
+        )
+        messagebox.showinfo("字幕已合并", f"合并字幕已保存到：\n{result.output_path}")
 
     @staticmethod
     def _snapshot_whisper_values(values: dict[str, tk.StringVar]) -> dict[str, str]:

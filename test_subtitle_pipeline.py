@@ -158,6 +158,45 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
             self.assertEqual(command[-1], "https://example.test/watch?v=123")
 
+    def test_manual_subtitle_merge_groups_overlaps_and_uses_selected_side(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            subtitle_a = folder / "A.srt"
+            subtitle_b = folder / "B.srt"
+            subtitle_a.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\nA 冲突\n\n"
+                "2\n00:00:04,000 --> 00:00:05,000\nA 独立\n",
+                encoding="utf-8",
+            )
+            subtitle_b.write_text(
+                "1\n00:00:01,000 --> 00:00:03,000\nB 冲突\n\n"
+                "2\n00:00:06,000 --> 00:00:07,000\nB 独立\n",
+                encoding="utf-8",
+            )
+
+            prepared = subtitle_pipeline.prepare_manual_subtitle_merge(
+                subtitle_a, subtitle_b, folder
+            )
+            self.assertEqual(len(prepared.conflicts), 1)
+            self.assertEqual(prepared.conflicts[0].a_entries[0][2], "A 冲突")
+            self.assertEqual(prepared.conflicts[0].b_entries[0][2], "B 冲突")
+            self.assertEqual(len(prepared.non_conflicting_entries), 2)
+
+            output = subtitle_pipeline.complete_manual_subtitle_merge(
+                prepared, [list(prepared.conflicts[0].b_entries)]
+            )
+            merged = output.output_path.read_text(encoding="utf-8")
+            self.assertIn("B 冲突", merged)
+            self.assertIn("A 独立", merged)
+            self.assertIn("B 独立", merged)
+            self.assertNotIn("A 冲突", merged)
+
+    def test_parse_editable_srt_text_accepts_edited_srt(self):
+        entries = subtitle_pipeline.parse_editable_srt_text(
+            "1\n00:00:01,000 --> 00:00:02,500\n修改后的字幕\n"
+        )
+        self.assertEqual(entries, [(1.0, 2.5, "修改后的字幕")])
+
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")
         self.assertEqual(outputs.first_pass, Path("字幕") / "動画 01_A.srt")

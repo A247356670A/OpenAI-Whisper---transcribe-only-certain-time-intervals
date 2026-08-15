@@ -13,7 +13,13 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Callable, Mapping
-from SrtMerge import merge_srt, write_srt
+from SrtMerge import (
+    merge_srt,
+    parse_srt,
+    seconds_to_srt_time,
+    srt_time_to_seconds,
+    write_srt,
+)
 from SrtToIntervals import extract_time_intervals
 from exclude_segments_by_intervals import exclude_segments_by_intervals
 from transcribe import save_srt, transcribe, transcribe_segments
@@ -73,6 +79,36 @@ class DownloadedVideoOutput:
     output_dir: Path
 
 
+SubtitleEntry = tuple[float, float, str]
+
+
+@dataclass(frozen=True)
+class SubtitleConflictGroup:
+    """All mutually overlapping A/B entries that require one user choice."""
+
+    a_entries: tuple[SubtitleEntry, ...]
+    b_entries: tuple[SubtitleEntry, ...]
+
+
+@dataclass(frozen=True)
+class PreparedSubtitleMerge:
+    """The automatic and user-review portions of an A+B subtitle merge."""
+
+    subtitle_a: Path
+    subtitle_b: Path
+    output_path: Path
+    non_conflicting_entries: tuple[SubtitleEntry, ...]
+    conflicts: tuple[SubtitleConflictGroup, ...]
+
+
+@dataclass(frozen=True)
+class ManualSubtitleMergeOutput:
+    """The final SRT generated after the user has resolved all conflicts."""
+
+    output_path: Path
+    conflict_count: int
+
+
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
     """Return predictable, Unicode-safe output names for a video."""
     stem = Path(video_path).stem
@@ -104,6 +140,15 @@ def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> P
     """Return the non-destructive MP4 filename for a subtitle-burned video."""
     source = Path(video_path)
     return Path(output_dir) / f"{source.stem}_burned_subtitles.mp4"
+
+
+def build_manual_merge_path(
+    subtitle_a_path: str | Path, subtitle_b_path: str | Path, output_dir: str | Path
+) -> Path:
+    """Return a descriptive, non-destructive output name for a manual A+B merge."""
+    subtitle_a = Path(subtitle_a_path)
+    subtitle_b = Path(subtitle_b_path)
+    return Path(output_dir) / f"{subtitle_a.stem}_{subtitle_b.stem}_merged.srt"
 
 
 def _log(callback: LogCallback | None, message: str) -> None:
@@ -368,6 +413,133 @@ def extract_chinese_subtitles(
     )
     _log(log_callback, f"已从 {converted_count} 条字幕中保留第一行中文：{chinese_only}")
     return SubtitleSplitOutput(source_subtitle=source, chinese_only=chinese_only)
+
+
+def _entries_overlap(first: SubtitleEntry, second: SubtitleEntry) -> bool:
+    """Return whether two subtitle intervals overlap by a positive duration."""
+    return max(first[0], second[0]) < min(first[1], second[1])
+
+
+def _read_srt_entries(path: Path) -> list[SubtitleEntry]:
+    """Use the project's SrtMerge parser and normalize its mutable lists to tuples."""
+    return [(start, end, text) for start, end, text in parse_srt(str(path))]
+
+
+def format_srt_entries(entries: list[SubtitleEntry] | tuple[SubtitleEntry, ...]) -> str:
+    """Format entries as editable SRT text for the conflict-review dialog."""
+    blocks = []
+    for index, (start, end, text) in enumerate(entries, start=1):
+        blocks.append(
+            f"{index}\n{seconds_to_srt_time(start)} --> {seconds_to_srt_time(end)}\n{text}"
+        )
+    return "\n\n".join(blocks)
+
+
+def parse_editable_srt_text(text: str) -> list[SubtitleEntry]:
+    """Parse a user-edited SRT field and fail clearly if a time range is invalid."""
+    pattern = re.compile(
+        r"(?:^|\n\s*\n)(?:\s*\d+\s*\n)?"
+        r"(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*"
+        r"(\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\n|\Z)",
+        re.DOTALL,
+    )
+    entries: list[SubtitleEntry] = []
+    for match in pattern.finditer(text.strip()):
+        start = srt_time_to_seconds(match.group(1))
+        end = srt_time_to_seconds(match.group(2))
+        if end <= start:
+            raise ValueError("每条字幕的结束时间必须晚于开始时间。")
+        entries.append((start, end, match.group(3).strip().replace("\n", " ")))
+    if text.strip() and not entries:
+        raise ValueError("编辑内容不是有效的 SRT 格式。请保留时间轴行。")
+    return entries
+
+
+def prepare_manual_subtitle_merge(
+    subtitle_a_path: str | Path,
+    subtitle_b_path: str | Path,
+    output_dir: str | Path,
+) -> PreparedSubtitleMerge:
+    """Split A+B SRT entries into automatic entries and overlap-review groups."""
+    subtitle_a = Path(subtitle_a_path).expanduser().resolve()
+    subtitle_b = Path(subtitle_b_path).expanduser().resolve()
+    if not subtitle_a.is_file() or subtitle_a.suffix.lower() != ".srt":
+        raise ValueError("请选择有效的字幕 A（.srt）。")
+    if not subtitle_b.is_file() or subtitle_b.suffix.lower() != ".srt":
+        raise ValueError("请选择有效的字幕 B（.srt）。")
+
+    destination = Path(output_dir).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    a_entries = _read_srt_entries(subtitle_a)
+    b_entries = _read_srt_entries(subtitle_b)
+
+    # Build a bipartite graph: connected overlap groups become one review card.
+    a_links: dict[int, set[int]] = {index: set() for index in range(len(a_entries))}
+    b_links: dict[int, set[int]] = {index: set() for index in range(len(b_entries))}
+    for a_index, a_entry in enumerate(a_entries):
+        for b_index, b_entry in enumerate(b_entries):
+            if _entries_overlap(a_entry, b_entry):
+                a_links[a_index].add(b_index)
+                b_links[b_index].add(a_index)
+
+    conflicts: list[SubtitleConflictGroup] = []
+    visited_a: set[int] = set()
+    visited_b: set[int] = set()
+    for first_a in range(len(a_entries)):
+        if first_a in visited_a or not a_links[first_a]:
+            continue
+        component_a: set[int] = set()
+        component_b: set[int] = set()
+        pending: list[tuple[str, int]] = [("a", first_a)]
+        while pending:
+            side, index = pending.pop()
+            if side == "a":
+                if index in visited_a:
+                    continue
+                visited_a.add(index)
+                component_a.add(index)
+                pending.extend(("b", linked) for linked in a_links[index])
+            else:
+                if index in visited_b:
+                    continue
+                visited_b.add(index)
+                component_b.add(index)
+                pending.extend(("a", linked) for linked in b_links[index])
+        conflicts.append(
+            SubtitleConflictGroup(
+                a_entries=tuple(a_entries[index] for index in sorted(component_a)),
+                b_entries=tuple(b_entries[index] for index in sorted(component_b)),
+            )
+        )
+
+    non_conflicting = [
+        entry for index, entry in enumerate(a_entries) if not a_links[index]
+    ] + [entry for index, entry in enumerate(b_entries) if not b_links[index]]
+    return PreparedSubtitleMerge(
+        subtitle_a=subtitle_a,
+        subtitle_b=subtitle_b,
+        output_path=build_manual_merge_path(subtitle_a, subtitle_b, destination),
+        non_conflicting_entries=tuple(non_conflicting),
+        conflicts=tuple(conflicts),
+    )
+
+
+def complete_manual_subtitle_merge(
+    prepared: PreparedSubtitleMerge,
+    selected_entries: list[list[SubtitleEntry]],
+) -> ManualSubtitleMergeOutput:
+    """Write non-conflicting entries plus the user-selected conflict entries."""
+    if len(selected_entries) != len(prepared.conflicts):
+        raise ValueError("冲突处理结果数量与待处理冲突不一致。")
+    merged_entries = list(prepared.non_conflicting_entries)
+    for entries in selected_entries:
+        merged_entries.extend(entries)
+    merged_entries.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
+    write_srt(merged_entries, str(prepared.output_path))
+    return ManualSubtitleMergeOutput(
+        output_path=prepared.output_path,
+        conflict_count=len(prepared.conflicts),
+    )
 
 
 def _ffmpeg_filter_filename(path: Path) -> str:
