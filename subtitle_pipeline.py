@@ -460,7 +460,7 @@ def run_two_pass_transcription(
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
     duplicate_threshold: float = 0.5,
-    filter_silent_b: bool = True,
+    filter_silent_b: bool = False,
     b_audio_min_rms: float = B_AUDIO_MIN_RMS,
     b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
     b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
@@ -527,6 +527,10 @@ def run_two_pass_transcription(
     audio_segments, remaining_intervals = exclude_segments_by_intervals(
         audio_array, full_interval, excluded_intervals, sample_rate
     )
+    _log(
+        log_callback,
+        f"B 反向剪裁完成：得到 {len(audio_segments)} 个未覆盖片段。",
+    )
 
     if filter_silent_b and audio_segments:
         audio_segments, skipped_intervals = filter_silent_b_segments(
@@ -546,6 +550,11 @@ def run_two_pass_transcription(
                 f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
                 + ("，语音优先已开启）。" if b_speech_only else "）。"),
             )
+    elif audio_segments:
+        _log(
+            log_callback,
+            "B 音频预筛已关闭：保留全部反向剪裁出的 B 片段（与原始逻辑一致）。",
+        )
 
     if audio_segments:
         _progress(progress_callback, "subtitle_b", 0, len(audio_segments))
@@ -630,7 +639,7 @@ def run_second_pass_from_subtitle(
     *,
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
-    filter_silent_b: bool = True,
+    filter_silent_b: bool = False,
     b_audio_min_rms: float = B_AUDIO_MIN_RMS,
     b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
     b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
@@ -686,6 +695,10 @@ def run_second_pass_from_subtitle(
     audio_segments, remaining_intervals = exclude_segments_by_intervals(
         audio_array, full_interval, excluded_intervals, sample_rate
     )
+    _log(
+        log_callback,
+        f"B 反向剪裁完成：得到 {len(audio_segments)} 个未覆盖片段。",
+    )
 
     if filter_silent_b and audio_segments:
         audio_segments, skipped_intervals = filter_silent_b_segments(
@@ -705,6 +718,11 @@ def run_second_pass_from_subtitle(
                 f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
                 + ("，语音优先已开启）。" if b_speech_only else "）。"),
             )
+    elif audio_segments:
+        _log(
+            log_callback,
+            "B 音频预筛已关闭：保留全部反向剪裁出的 B 片段（与原始逻辑一致）。",
+        )
 
     if audio_segments:
         _progress(progress_callback, "subtitle_b", 0, len(audio_segments))

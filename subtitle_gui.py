@@ -430,7 +430,9 @@ class SubtitleApp:
         self.model_name = tk.StringVar(value="large-v2")
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
-        self.filter_silent_b = tk.BooleanVar(value=True)
+        # Opt-in only: unchecked means the exact pre-filter B workflow, where
+        # every gap left after reverse-cutting against subtitle A is retained.
+        self.filter_silent_b = tk.BooleanVar(value=False)
         self.b_audio_preset = tk.StringVar(value="仅跳过完全静音（推荐）")
         self.b_audio_min_rms = tk.StringVar(value="0.0001")
         self.b_audio_min_active_seconds = tk.StringVar(value="0.05")
@@ -676,7 +678,7 @@ class SubtitleApp:
         self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
         ttk.Checkbutton(
             options,
-            text="B 音频预筛（默认只跳过完全静音）",
+            text="启用 B 音频预筛（取消即保留所有反向剪裁 B 片段）",
             variable=self.filter_silent_b,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(options, text="预设").grid(row=1, column=2, sticky="e", padx=(14, 0), pady=(8, 0))
@@ -1310,7 +1312,10 @@ class SubtitleApp:
                 return
 
         b_audio_min_rms, b_audio_min_active_seconds, b_audio_silence_top_db = 0.0001, 0.05, 45
-        b_speech_only = self.b_speech_only.get()
+        # A VAD choice has no meaning without the master audio filter.  Freeze
+        # it as false here so an unchecked master switch always restores the
+        # original reverse-cut B behaviour.
+        b_speech_only = self.filter_silent_b.get() and self.b_speech_only.get()
         vad_aggressiveness = VAD_AGGRESSIVENESS[self.b_vad_strength.get()]
         if mode in ("full", "second_only") and self.filter_silent_b.get():
             try:
