@@ -110,7 +110,8 @@ def transcribe(file_path,
 def transcribe_segments(audio_segments,
                         second_whisper_options,
                         model,
-                        second_srt_file):
+                        second_srt_file,
+                        progress_callback=None):
     """Transcribe only uncovered audio slices and restore their source offsets."""
 
     # B may use a different task/options from A, configured in the GUI.
@@ -129,6 +130,8 @@ def transcribe_segments(audio_segments,
                     f"Skip segment {i}, duration={duration:.3f}s"
                 )
                 continue
+            if progress_callback:
+                progress_callback(i, len(audio_segments))
             print(
                 f"Segment {i} - second "
                 f"{audio_segment[0]} to {audio_segment[1]}"
@@ -168,6 +171,8 @@ def transcribe_segments(audio_segments,
                     )
 
             print()
+            if progress_callback:
+                progress_callback(i + 1, len(audio_segments))
 
         # 正常结束
         output_srt_path = save_srt(subtitles, second_srt_file)

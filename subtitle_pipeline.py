@@ -28,6 +28,7 @@ from whisper_options import build_whisper_options
 
 
 LogCallback = Callable[[str], None]
+ProgressCallback = Callable[[str, float, float], None]
 
 
 # Conservative B-pass audio gate: only near-silent gaps are skipped.  Spoken
@@ -203,6 +204,14 @@ def _log(callback: LogCallback | None, message: str) -> None:
         print(message)
 
 
+def _progress(
+    callback: ProgressCallback | None, stage: str, current: float, total: float
+) -> None:
+    """Send lightweight progress updates without coupling the pipeline to Tk."""
+    if callback:
+        callback(stage, current, total)
+
+
 def _import_dependencies():
     """Import large optional dependencies at run time with a helpful error."""
     try:
@@ -227,6 +236,92 @@ def _reserve_cpu_for_gui(torch: Any) -> None:
     except (AttributeError, RuntimeError):
         # Some Torch builds do not allow changing this after initialization.
         pass
+
+
+def _probe_media_duration(path: Path) -> float | None:
+    """Read media duration via ffprobe when available for an A-pass progress bar."""
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+        duration = float(result.stdout.strip())
+        return duration if duration > 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _probe_video_frame_count(path: Path) -> float | None:
+    """Estimate total frames from ffprobe for burn-in progress reporting."""
+    ffprobe = _find_ffprobe()
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=nb_frames,avg_frame_rate,duration",
+                "-of",
+                "default=noprint_wrappers=1",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    values = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    try:
+        frame_count = float(values.get("nb_frames", "0"))
+        if frame_count > 0:
+            return frame_count
+        numerator, denominator = values["avg_frame_rate"].split("/", 1)
+        frame_rate = float(numerator) / float(denominator)
+        duration = float(values["duration"])
+        return frame_rate * duration if frame_rate > 0 and duration > 0 else None
+    except (KeyError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _find_ffprobe() -> str | None:
+    """Locate ffprobe beside FFmpeg too, for installations not added fully to PATH."""
+    if ffprobe := shutil.which("ffprobe"):
+        return ffprobe
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    ffmpeg_path = Path(ffmpeg)
+    suffix = ffmpeg_path.suffix
+    candidate = ffmpeg_path.with_name(f"ffprobe{suffix}")
+    return str(candidate) if candidate.is_file() else None
 
 
 def filter_silent_b_segments(
@@ -278,6 +373,7 @@ def run_two_pass_transcription(
     first_whisper_values: Mapping[str, Any] | None = None,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> SubtitleOutputs:
     """Generate A, B and merged Japanese SRT files from *video_path*.
 
@@ -304,6 +400,9 @@ def run_two_pass_transcription(
             "未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。"
         )
 
+    a_duration = _probe_media_duration(source) if progress_callback else None
+    _progress(progress_callback, "subtitle_a", 0, a_duration or 0)
+
     librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -321,6 +420,7 @@ def run_two_pass_transcription(
 
     _log(log_callback, "第 1 步/3：识别完整视频，生成字幕 A…")
     transcribe(str(source), first_options, model, str(outputs.first_pass))
+    _progress(progress_callback, "subtitle_a", a_duration or 1, a_duration or 1)
 
     _log(log_callback, "正在读取音频并计算 A 未覆盖的片段…")
     audio_array, sample_rate = librosa.load(str(source), sr=16_000, mono=True)
@@ -343,14 +443,22 @@ def run_two_pass_transcription(
             )
 
     if audio_segments:
+        _progress(progress_callback, "subtitle_b", 0, len(audio_segments))
         _log(
             log_callback,
             f"第 2 步/3：识别 {len(audio_segments)} 个未覆盖片段，生成字幕 B…",
         )
         transcribe_segments(
-            audio_segments, second_options, model, str(outputs.second_pass)
+            audio_segments,
+            second_options,
+            model,
+            str(outputs.second_pass),
+            progress_callback=lambda current, total: _progress(
+                progress_callback, "subtitle_b", current, total
+            ),
         )
     else:
+        _progress(progress_callback, "subtitle_b", 1, 1)
         _log(log_callback, "第 2 步/3：没有可识别的 B 音频片段，创建空的字幕 B。")
         save_srt([], str(outputs.second_pass))
 
@@ -372,6 +480,7 @@ def run_first_pass_transcription(
     model_name: str = "large-v2",
     first_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> FirstPassOutput:
     """Transcribe the entire source once and create only subtitle A."""
     source = Path(video_path).expanduser().resolve()
@@ -389,6 +498,9 @@ def run_first_pass_transcription(
             "未找到 FFmpeg。请先安装 FFmpeg 并将其加入系统 PATH，然后重新运行。"
         )
 
+    a_duration = _probe_media_duration(source) if progress_callback else None
+    _progress(progress_callback, "subtitle_a", 0, a_duration or 0)
+
     _librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -401,6 +513,7 @@ def run_first_pass_transcription(
 
     _log(log_callback, "仅生成 A：正在识别完整视频…")
     transcribe(str(source), first_options, model, str(first_pass))
+    _progress(progress_callback, "subtitle_a", a_duration or 1, a_duration or 1)
     _log(log_callback, f"完成：仅生成字幕 A：{first_pass}")
     return FirstPassOutput(first_pass=first_pass)
 
@@ -415,6 +528,7 @@ def run_second_pass_from_subtitle(
     filter_silent_b: bool = True,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> SecondPassOutput:
     """Create only B from a video and an existing (for example translated) A.
 
@@ -474,12 +588,22 @@ def run_second_pass_from_subtitle(
             )
 
     if audio_segments:
+        _progress(progress_callback, "subtitle_b", 0, len(audio_segments))
         _log(
             log_callback,
             f"仅生成 B：正在识别 {len(audio_segments)} 个未覆盖片段…",
         )
-        transcribe_segments(audio_segments, second_options, model, str(second_pass))
+        transcribe_segments(
+            audio_segments,
+            second_options,
+            model,
+            str(second_pass),
+            progress_callback=lambda current, total: _progress(
+                progress_callback, "subtitle_b", current, total
+            ),
+        )
     else:
+        _progress(progress_callback, "subtitle_b", 1, 1)
         _log(log_callback, "没有可识别的 B 音频片段，创建空的字幕 B。")
         save_srt([], str(second_pass))
 
@@ -771,6 +895,7 @@ def download_video_as_mp4(
     output_dir: str | Path,
     *,
     log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> DownloadedVideoOutput:
     """Download *link* as MP4 with the project's selected yt-dlp command."""
     source_url = link.strip()
@@ -809,6 +934,7 @@ def download_video_as_mp4(
         '--http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+'
         'ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"',
     )
+    _progress(progress_callback, "download", 0, 100)
     process = subprocess.Popen(
         command,
         cwd=str(destination),
@@ -825,6 +951,7 @@ def download_video_as_mp4(
                 _log(log_callback, line)
     if process.wait() != 0:
         raise RuntimeError("yt-dlp 下载失败。请查看运行日志中的错误信息。")
+    _progress(progress_callback, "download", 100, 100)
     _log(log_callback, f"完成：视频已保存到 {destination}")
     return DownloadedVideoOutput(source_url=source_url, output_dir=destination)
 
@@ -835,6 +962,7 @@ def burn_subtitles_to_mp4(
     output_dir: str | Path | None = None,
     *,
     log_callback: LogCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> BurnedSubtitleVideoOutput:
     """Convert a video to H.264/AAC MP4 while permanently burning in an SRT.
 
@@ -893,6 +1021,8 @@ def burn_subtitles_to_mp4(
     else:
         _log(log_callback, f"输入为 {source_video.suffix or '未知格式'}，正在转换为 MP4 并烧录字幕…")
     _log(log_callback, "烧录字幕必须重新编码视频；时长取决于视频长度和电脑性能。")
+    total_frames = _probe_video_frame_count(source_video) if progress_callback else None
+    _progress(progress_callback, "burn", 0, total_frames or 0)
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -908,6 +1038,7 @@ def burn_subtitles_to_mp4(
                 _log(log_callback, line)
     if process.wait() != 0:
         raise RuntimeError("FFmpeg 烧录字幕失败。请查看运行日志中的 FFmpeg 错误信息。")
+    _progress(progress_callback, "burn", total_frames or 1, total_frames or 1)
     _log(log_callback, f"完成：字幕已烧录到 MP4：{burned_video}")
     return BurnedSubtitleVideoOutput(
         source_video=source_video,

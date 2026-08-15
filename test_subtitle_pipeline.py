@@ -348,6 +348,35 @@ class SubtitlePipelineTests(unittest.TestCase):
                 "1\n00:00:00,000 --> 00:00:02,000\n翻译字幕\n\n",
             )
 
+    def test_second_pass_reports_b_progress_by_segment_number(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            source = folder / "動画.mp4"
+            source.touch()
+            translated_a = folder / "A.srt"
+            translated_a.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\n字幕 A\n", encoding="utf-8"
+            )
+            progress = []
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch(
+                    "subtitle_pipeline._import_dependencies",
+                    return_value=(_FakeLibrosa, _FakeTorch, _FakeWhisper),
+                ),
+            ):
+                subtitle_pipeline.run_second_pass_from_subtitle(
+                    source,
+                    translated_a,
+                    folder,
+                    progress_callback=lambda stage, current, total: progress.append(
+                        (stage, current, total)
+                    ),
+                )
+
+            self.assertIn(("subtitle_b", 0, 1), progress)
+            self.assertIn(("subtitle_b", 1, 1), progress)
+
     def test_extract_chinese_subtitles_keeps_first_text_line(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             folder = Path(temporary_directory)
