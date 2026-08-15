@@ -405,6 +405,7 @@ class SubtitleApp:
         self.model_name = tk.StringVar(value="large-v2")
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
+        self.filter_silent_b = tk.BooleanVar(value=True)
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.first_whisper_values = {
             key: tk.StringVar(value=value)
@@ -608,11 +609,16 @@ class SubtitleApp:
         ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=4, sticky="w")
         self.threshold_entry = ttk.Entry(options, textvariable=self.duplicate_threshold, width=8)
         self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        ttk.Checkbutton(
+            options,
+            text="B 静音预筛（跳过近似静音片段，默认开启）",
+            variable=self.filter_silent_b,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Button(
             options,
             text="第一/二轮 Whisper 高级参数…",
             command=self._show_whisper_options,
-        ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(26, 0), pady=(8, 0))
 
         preview = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
         preview.pack(fill="x", pady=(6, 7))
@@ -1041,6 +1047,7 @@ class SubtitleApp:
                 self.model_name.get(),
                 merge_gap,
                 duplicate_threshold,
+                self.filter_silent_b.get(),
                 self._snapshot_whisper_values(self.first_whisper_values),
                 self._snapshot_whisper_values(self.second_whisper_values),
             ),
@@ -1120,6 +1127,7 @@ class SubtitleApp:
         model_name: str,
         merge_gap: float,
         duplicate_threshold: float,
+        filter_silent_b: bool,
         first_whisper_values: dict[str, str],
         second_whisper_values: dict[str, str],
     ) -> None:
@@ -1133,6 +1141,7 @@ class SubtitleApp:
                         output,
                         model_name=model_name,
                         merge_gap=merge_gap,
+                        filter_silent_b=filter_silent_b,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
@@ -1170,6 +1179,7 @@ class SubtitleApp:
                         model_name=model_name,
                         merge_gap=merge_gap,
                         duplicate_threshold=duplicate_threshold,
+                        filter_silent_b=filter_silent_b,
                         first_whisper_values=first_whisper_values,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),

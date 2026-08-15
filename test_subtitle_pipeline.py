@@ -41,10 +41,16 @@ class _FakeTorch:
 
 
 class _FakeLibrosa:
+    class effects:
+        @staticmethod
+        def split(samples, top_db):
+            assert top_db == subtitle_pipeline.B_AUDIO_SILENCE_TOP_DB
+            return [[0, len(samples)]] if len(samples) else []
+
     @staticmethod
     def load(_source, sr, mono):
         assert sr == 16_000 and mono is True
-        return [0.0] * (sr * 5), sr
+        return [0.02] * (sr * 5), sr
 
 
 class SubtitlePipelineTests(unittest.TestCase):
@@ -77,6 +83,26 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(intervals, [[0, 1.0]])
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0][:2], [0, 1.0])
+
+    def test_silent_b_audio_segments_are_skipped_before_transcription(self):
+        class _FilterLibrosa:
+            class effects:
+                @staticmethod
+                def split(samples, top_db):
+                    if max(abs(sample) for sample in samples) == 0:
+                        return []
+                    return [[0, len(samples)]]
+
+        kept, skipped = subtitle_pipeline.filter_silent_b_segments(
+            [
+                [0.0, 1.0, [0.0] * 16_000],
+                [1.0, 2.0, [0.02] * 16_000],
+            ],
+            16_000,
+            _FilterLibrosa,
+        )
+        self.assertEqual([segment[:2] for segment in kept], [[1.0, 2.0]])
+        self.assertEqual(skipped, [(0.0, 1.0)])
 
     def test_burn_subtitles_builds_h264_mp4_command(self):
         class _FakeProcess:

@@ -29,6 +29,13 @@ from whisper_options import build_whisper_options
 LogCallback = Callable[[str], None]
 
 
+# Conservative B-pass audio gate: only near-silent gaps are skipped.  Spoken
+# dialogue and music are deliberately retained for Whisper to avoid omissions.
+B_AUDIO_MIN_RMS = 0.001
+B_AUDIO_MIN_ACTIVE_SECONDS = 0.25
+B_AUDIO_SILENCE_TOP_DB = 35
+
+
 @dataclass(frozen=True)
 class SubtitleOutputs:
     """Files produced by a completed two-pass transcription."""
@@ -209,6 +216,44 @@ def _import_dependencies():
     return librosa, torch, whisper
 
 
+def filter_silent_b_segments(
+    audio_segments: list[list[Any]],
+    sample_rate: int,
+    librosa: Any,
+) -> tuple[list[list[Any]], list[tuple[float, float]]]:
+    """Keep B candidate slices that contain meaningful non-silent audio.
+
+    ``librosa.effects.split`` identifies active portions relative to the
+    segment's volume; RMS adds an absolute floor so digital silence is not
+    mistaken for audio.  This intentionally does not try to remove BGM,
+    because a simple volume gate cannot distinguish it safely from dialogue.
+    """
+    kept_segments: list[list[Any]] = []
+    skipped_intervals: list[tuple[float, float]] = []
+    for start, end, samples in audio_segments:
+        if len(samples) == 0:
+            skipped_intervals.append((float(start), float(end)))
+            continue
+        try:
+            # NumPy audio arrays use this vectorized fast path.
+            rms = float(((samples * samples).mean()) ** 0.5)
+        except (AttributeError, TypeError):
+            # Keep the helper import-safe for lightweight test and GUI setups.
+            rms = (sum(float(sample) ** 2 for sample in samples) / len(samples)) ** 0.5
+        active_ranges = librosa.effects.split(
+            samples, top_db=B_AUDIO_SILENCE_TOP_DB
+        )
+        active_seconds = sum(
+            (int(range_end) - int(range_start)) / sample_rate
+            for range_start, range_end in active_ranges
+        )
+        if rms < B_AUDIO_MIN_RMS or active_seconds < B_AUDIO_MIN_ACTIVE_SECONDS:
+            skipped_intervals.append((float(start), float(end)))
+        else:
+            kept_segments.append([start, end, samples])
+    return kept_segments, skipped_intervals
+
+
 def run_two_pass_transcription(
     video_path: str | Path,
     output_dir: str | Path | None = None,
@@ -216,6 +261,7 @@ def run_two_pass_transcription(
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
     duplicate_threshold: float = 0.5,
+    filter_silent_b: bool = True,
     first_whisper_values: Mapping[str, Any] | None = None,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
@@ -271,16 +317,26 @@ def run_two_pass_transcription(
         audio_array, full_interval, excluded_intervals, sample_rate
     )
 
-    if remaining_intervals:
+    if filter_silent_b and audio_segments:
+        audio_segments, skipped_intervals = filter_silent_b_segments(
+            audio_segments, sample_rate, librosa
+        )
+        if skipped_intervals:
+            _log(
+                log_callback,
+                f"B 音频预筛：跳过 {len(skipped_intervals)} 个近似静音的未覆盖片段。",
+            )
+
+    if audio_segments:
         _log(
             log_callback,
-            f"第 2 步/3：识别 {len(remaining_intervals)} 个未覆盖片段，生成字幕 B…",
+            f"第 2 步/3：识别 {len(audio_segments)} 个未覆盖片段，生成字幕 B…",
         )
         transcribe_segments(
             audio_segments, second_options, model, str(outputs.second_pass)
         )
     else:
-        _log(log_callback, "第 2 步/3：A 已覆盖全部音频，创建空的字幕 B。")
+        _log(log_callback, "第 2 步/3：没有可识别的 B 音频片段，创建空的字幕 B。")
         save_srt([], str(outputs.second_pass))
 
     _log(log_callback, "第 3 步/3：合并 A 与 B，并移除重复字幕…")
@@ -339,6 +395,7 @@ def run_second_pass_from_subtitle(
     *,
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
+    filter_silent_b: bool = True,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
 ) -> SecondPassOutput:
@@ -387,14 +444,24 @@ def run_second_pass_from_subtitle(
         audio_array, full_interval, excluded_intervals, sample_rate
     )
 
-    if remaining_intervals:
+    if filter_silent_b and audio_segments:
+        audio_segments, skipped_intervals = filter_silent_b_segments(
+            audio_segments, sample_rate, librosa
+        )
+        if skipped_intervals:
+            _log(
+                log_callback,
+                f"B 音频预筛：跳过 {len(skipped_intervals)} 个近似静音的未覆盖片段。",
+            )
+
+    if audio_segments:
         _log(
             log_callback,
-            f"仅生成 B：正在识别 {len(remaining_intervals)} 个未覆盖片段…",
+            f"仅生成 B：正在识别 {len(audio_segments)} 个未覆盖片段…",
         )
         transcribe_segments(audio_segments, second_options, model, str(second_pass))
     else:
-        _log(log_callback, "字幕 A 已覆盖全部音频，创建空的字幕 B。")
+        _log(log_callback, "没有可识别的 B 音频片段，创建空的字幕 B。")
         save_srt([], str(second_pass))
 
     _log(log_callback, f"完成：仅生成字幕 B：{second_pass}")
