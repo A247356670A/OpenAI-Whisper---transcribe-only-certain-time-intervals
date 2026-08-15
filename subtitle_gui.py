@@ -12,19 +12,23 @@ import threading
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
+from SrtMerge import seconds_to_srt_time
 from subtitle_pipeline import (
     build_output_paths,
     build_chinese_only_path,
     build_burned_video_path,
+    build_hallucination_cleanup_path,
     build_manual_merge_path,
     build_second_pass_path,
     burn_subtitles_to_mp4,
+    complete_hallucination_cleanup,
     complete_manual_subtitle_merge,
     download_video_as_mp4,
     extract_chinese_subtitles,
     format_srt_entries,
     parse_editable_srt_text,
     prepare_manual_subtitle_merge,
+    prepare_hallucination_cleanup,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
@@ -279,6 +283,109 @@ class SubtitleConflictDialog:
         self.on_complete(result)
 
 
+class HallucinationReviewDialog:
+    """Show suspicious subtitles with context and require opt-in deletion."""
+
+    def __init__(self, parent: tk.Tk, prepared, on_complete) -> None:
+        self.prepared = prepared
+        self.on_complete = on_complete
+        self.delete_flags: list[tuple[int, tk.BooleanVar]] = []
+        self.window = tk.Toplevel(parent)
+        self.window.title("审核可能的幻觉字幕")
+        self.window.geometry("1320x820")
+        self.window.minsize(960, 620)
+        self.window.transient(parent)
+        self.window.configure(padx=14, pady=12)
+
+        ttk.Label(
+            self.window,
+            text=(
+                f"发现 {len(prepared.candidates)} 条可能的幻觉字幕。默认不会删除；"
+                "请勾选确认删除。每项均显示时间、文本及前后字幕上下文。"
+            ),
+            style="Hint.TLabel",
+            wraplength=1240,
+        ).pack(anchor="w", pady=(0, 9))
+
+        holder = ttk.Frame(self.window)
+        holder.pack(fill="both", expand=True)
+        canvas = tk.Canvas(holder, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        content = ttk.Frame(canvas)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        content.columnconfigure(0, weight=1)
+
+        for card_index, candidate in enumerate(prepared.candidates, start=1):
+            self._add_candidate_card(content, card_index, candidate)
+
+        content.bind(
+            "<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda event: canvas.itemconfigure(content_window, width=event.width)
+        )
+
+        buttons = ttk.Frame(self.window)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right")
+        ttk.Button(buttons, text="生成清理后字幕", command=self._save).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="全部取消", command=lambda: self._set_all(False)).pack(side="left")
+        ttk.Button(buttons, text="全部勾选删除", command=lambda: self._set_all(True)).pack(side="left", padx=(0, 8))
+
+    def _add_candidate_card(self, parent: ttk.Frame, card_index: int, candidate) -> None:
+        start, end, text = candidate.entry
+        card = ttk.LabelFrame(parent, text=f"可疑字幕 {card_index}", padding=8)
+        card.grid(row=card_index - 1, column=0, sticky="ew", pady=(0, 8))
+        card.columnconfigure(0, weight=1)
+        flag = tk.BooleanVar(value=False)
+        self.delete_flags.append((candidate.entry_index, flag))
+        ttk.Checkbutton(card, text="确认删除此条字幕", variable=flag).grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            card,
+            text=(
+                f"时间：{seconds_to_srt_time(start)} → {seconds_to_srt_time(end)}    "
+                f"标记原因：{'、'.join(candidate.reasons)}"
+            ),
+            style="Hint.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(card, text=f"字幕：{text}", wraplength=1180).grid(
+            row=2, column=0, sticky="w", pady=(4, 0)
+        )
+        previous = self._format_context("前一条", candidate.previous_entry)
+        following = self._format_context("后一条", candidate.next_entry)
+        ttk.Label(
+            card,
+            text=f"上下文\n{previous}\n{following}",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=1180,
+        ).grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+    @staticmethod
+    def _format_context(label: str, entry) -> str:
+        if entry is None:
+            return f"{label}：无"
+        start, end, text = entry
+        return f"{label}（{seconds_to_srt_time(start)} → {seconds_to_srt_time(end)}）：{text}"
+
+    def _set_all(self, value: bool) -> None:
+        for _entry_index, flag in self.delete_flags:
+            flag.set(value)
+
+    def _save(self) -> None:
+        delete_indices = {
+            entry_index for entry_index, flag in self.delete_flags if flag.get()
+        }
+        result = complete_hallucination_cleanup(self.prepared, delete_indices)
+        self.window.destroy()
+        self.on_complete(result)
+
+
 class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -408,6 +515,13 @@ class SubtitleApp:
             variable=self.run_mode,
             command=self._on_mode_changed,
         ).grid(row=1, column=2, sticky="w", padx=(0, 12), pady=(5, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="清理可疑幻觉字幕：审核后手动删除",
+            value="hallucination_cleanup",
+            variable=self.run_mode,
+            command=self._on_mode_changed,
+        ).grid(row=1, column=3, sticky="w", pady=(5, 0))
 
         self.drop_zone = ttk.Label(
             self.root,
@@ -572,6 +686,14 @@ class SubtitleApp:
             self.subtitle_b_row.pack(fill="x", pady=(0, 7), before=self.output_row)
             self.subtitle_row.pack(fill="x", pady=(0, 7), before=self.subtitle_b_row)
             self.threshold_entry.configure(state="disabled")
+        elif mode == "hallucination_cleanup":
+            self.drop_zone.pack(fill="x", before=self.subtitle_row)
+            self.video_row.pack_forget()
+            self.subtitle_label.configure(text="字幕文件")
+            self.subtitle_button.configure(text="添加字幕")
+            self.subtitle_row.pack(fill="x", pady=(14, 7), after=self.drop_zone)
+            self.drop_zone.configure(text="将要审核的 SRT 字幕拖到这里\n或在下方点击“添加字幕”")
+            self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
             self.drop_zone.pack(fill="x", before=self.subtitle_row)
             self.video_row.pack_forget()
@@ -590,6 +712,12 @@ class SubtitleApp:
             else:
                 self.drop_zone.configure(text="将视频拖到这里\n或点击“选择视频”")
                 self.threshold_entry.configure(state="normal")
+        start_labels = {
+            "merge_subtitles": "开始合并字幕",
+            "hallucination_cleanup": "开始审核字幕",
+            "download_mp4": "开始下载 MP4",
+        }
+        self.start_button.configure(text=start_labels.get(mode, "开始提取字幕"))
         self._update_preview()
 
     def _choose_video(self) -> None:
@@ -600,7 +728,7 @@ class SubtitleApp:
     def _on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            if self.run_mode.get() == "split_chinese":
+            if self.run_mode.get() in ("split_chinese", "hallucination_cleanup"):
                 self._set_subtitle_a(paths[0])
             else:
                 self._set_video(paths[0])
@@ -626,8 +754,14 @@ class SubtitleApp:
         self.status.set("已选择视频，可以开始。")
 
     def _choose_subtitle_a(self) -> None:
+        mode = self.run_mode.get()
+        title = {
+            "hallucination_cleanup": "添加要审核的字幕",
+            "split_chinese": "选择中日双语字幕",
+            "merge_subtitles": "选择字幕 A",
+        }.get(mode, "选择已翻译的字幕 A")
         path = filedialog.askopenfilename(
-            title="选择已翻译的字幕 A",
+            title=title,
             filetypes=[("SRT 字幕", "*.srt"), ("所有文件", "*.*")],
         )
         if path:
@@ -647,7 +781,11 @@ class SubtitleApp:
             messagebox.showerror("无法读取字幕", "请选择一个有效的 .srt 字幕文件。")
             return
         self.subtitle_a_path.set(str(subtitle.resolve()))
-        if self.run_mode.get() in ("split_chinese", "merge_subtitles") and not self.output_dir.get():
+        if self.run_mode.get() in (
+            "split_chinese",
+            "merge_subtitles",
+            "hallucination_cleanup",
+        ) and not self.output_dir.get():
             self.output_dir.set(str(subtitle.parent.resolve()))
         self._update_preview()
 
@@ -668,6 +806,20 @@ class SubtitleApp:
 
     def _update_preview(self) -> None:
         mode = self.run_mode.get()
+        if mode == "hallucination_cleanup":
+            if not self.subtitle_a_path.get():
+                self.output_preview.set("清理可疑幻觉字幕：请选择要审核的 .srt 文件。")
+                return
+            output_dir = self.output_dir.get() or str(Path(self.subtitle_a_path.get()).parent)
+            cleaned_path = build_hallucination_cleanup_path(
+                self.subtitle_a_path.get(), output_dir
+            )
+            self.output_preview.set(
+                f"原字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
+                f"清理后字幕：{cleaned_path.name}\n"
+                "将列出可能是 BGM、片尾或感谢观看的字幕，由你勾选确认删除。"
+            )
+            return
         if mode == "merge_subtitles":
             if not self.subtitle_a_path.get() or not self.subtitle_b_path.get():
                 self.output_preview.set("合并字幕模式：请分别选择字幕 A 和字幕 B。")
@@ -769,30 +921,47 @@ class SubtitleApp:
         download_link = self.download_link.get().strip()
         output = self.output_dir.get().strip()
         mode = self.run_mode.get()
-        if mode not in ("split_chinese", "download_mp4", "merge_subtitles") and not video:
+        if mode not in (
+            "split_chinese",
+            "download_mp4",
+            "merge_subtitles",
+            "hallucination_cleanup",
+        ) and not video:
             messagebox.showwarning("请选择视频", "请拖入视频文件，或点击“选择视频”。")
             return
         if mode == "download_mp4" and not download_link:
             messagebox.showwarning("请输入链接", "请输入要下载的视频链接。")
             return
-        if not output and mode != "split_chinese":
+        if not output and mode not in ("split_chinese", "hallucination_cleanup"):
             messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
             return
         if mode == "merge_subtitles" and (not subtitle_a or not subtitle_b):
             messagebox.showwarning("请选择字幕", "请分别选择字幕 A 和字幕 B（.srt）。")
             return
-        if mode in ("second_only", "split_chinese", "burn_subtitles") and not subtitle_a:
+        if mode in (
+            "second_only",
+            "split_chinese",
+            "burn_subtitles",
+            "hallucination_cleanup",
+        ) and not subtitle_a:
             required_name = {
                 "split_chinese": "中日双语字幕",
                 "second_only": "翻译字幕 A",
                 "burn_subtitles": "要烧录的字幕",
+                "hallucination_cleanup": "要审核的字幕",
             }[mode]
             messagebox.showwarning("请选择字幕", f"请选择{required_name}（.srt）。")
             return
-        if mode == "split_chinese" and not output:
+        if mode in ("split_chinese", "hallucination_cleanup") and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
-        if mode in ("split_chinese", "burn_subtitles", "download_mp4", "merge_subtitles"):
+        if mode in (
+            "split_chinese",
+            "burn_subtitles",
+            "download_mp4",
+            "merge_subtitles",
+            "hallucination_cleanup",
+        ):
             merge_gap, duplicate_threshold = 1.0, 0.5
         else:
             try:
@@ -807,6 +976,9 @@ class SubtitleApp:
         if mode == "split_chinese":
             split_output = build_chinese_only_path(subtitle_a, output)
             existing = [split_output.name] if split_output.exists() else []
+        elif mode == "hallucination_cleanup":
+            cleaned_path = build_hallucination_cleanup_path(subtitle_a, output)
+            existing = [cleaned_path.name] if cleaned_path.exists() else []
         elif mode == "burn_subtitles":
             burned_video = build_burned_video_path(video, output)
             existing = [burned_video.name] if burned_video.exists() else []
@@ -839,6 +1011,9 @@ class SubtitleApp:
 
         if mode == "merge_subtitles":
             self._start_manual_subtitle_merge(subtitle_a, subtitle_b, output)
+            return
+        if mode == "hallucination_cleanup":
+            self._start_hallucination_cleanup(subtitle_a, output)
             return
 
         self.running = True
@@ -898,6 +1073,37 @@ class SubtitleApp:
             f"完成：已合并字幕 A+B（处理 {result.conflict_count} 组时间轴冲突）：{result.output_path}"
         )
         messagebox.showinfo("字幕已合并", f"合并字幕已保存到：\n{result.output_path}")
+
+    def _start_hallucination_cleanup(self, subtitle_path: str, output: str) -> None:
+        """Find review candidates, then let the user explicitly approve deletion."""
+        try:
+            prepared = prepare_hallucination_cleanup(subtitle_path, output)
+            self._append_log(
+                f"开始审核可能的幻觉字幕：发现 {len(prepared.candidates)} 条可疑字幕。"
+            )
+            if prepared.candidates:
+                HallucinationReviewDialog(
+                    self.root, prepared, self._hallucination_cleanup_completed
+                )
+                return
+            result = complete_hallucination_cleanup(prepared, set())
+        except (OSError, ValueError) as exc:
+            self.status.set("处理失败，请检查字幕文件。")
+            self._append_log(f"错误：{exc}")
+            messagebox.showerror("处理失败", str(exc))
+            return
+        self._hallucination_cleanup_completed(result)
+
+    def _hallucination_cleanup_completed(self, result) -> None:
+        """Report the saved review result without ever changing the source SRT."""
+        self.status.set("处理完成。")
+        self._append_log(
+            f"完成：已删除 {result.removed_count} 条确认的可疑字幕：{result.output_path}"
+        )
+        messagebox.showinfo(
+            "清理完成",
+            f"已删除 {result.removed_count} 条字幕。\n清理后字幕已保存到：\n{result.output_path}",
+        )
 
     @staticmethod
     def _snapshot_whisper_values(values: dict[str, tk.StringVar]) -> dict[str, str]:

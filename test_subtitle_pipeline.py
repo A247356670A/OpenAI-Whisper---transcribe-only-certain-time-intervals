@@ -197,6 +197,46 @@ class SubtitlePipelineTests(unittest.TestCase):
         )
         self.assertEqual(entries, [(1.0, 2.5, "修改后的字幕")])
 
+    def test_hallucination_cleanup_lists_context_and_removes_only_confirmed_entries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            source = folder / "字幕.srt"
+            source.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n正常开场\n\n"
+                "2\n00:00:01,000 --> 00:00:02,000\n(♪ BGM)\n\n"
+                "3\n00:00:02,000 --> 00:00:03,000\n正常内容\n\n"
+                "4\n00:00:03,000 --> 00:00:04,000\nご視聴ありがとうございました。\n\n"
+                "5\n00:00:04,000 --> 00:00:05,000\n(エンディング)\n",
+                encoding="utf-8",
+            )
+
+            prepared = subtitle_pipeline.prepare_hallucination_cleanup(source, folder)
+            self.assertEqual(len(prepared.candidates), 3)
+            bgm = prepared.candidates[0]
+            self.assertEqual(bgm.entry[2], "(♪ BGM)")
+            self.assertEqual(bgm.previous_entry[2], "正常开场")
+            self.assertEqual(bgm.next_entry[2], "正常内容")
+
+            output = subtitle_pipeline.complete_hallucination_cleanup(
+                prepared, {prepared.candidates[0].entry_index, prepared.candidates[2].entry_index}
+            )
+            cleaned = output.output_path.read_text(encoding="utf-8")
+            self.assertEqual(output.removed_count, 2)
+            self.assertNotIn("(♪ BGM)", cleaned)
+            self.assertNotIn("(エンディング)", cleaned)
+            self.assertIn("ご視聴ありがとうございました。", cleaned)
+
+    def test_hallucination_cleanup_rejects_unlisted_deletion(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            source = folder / "字幕.srt"
+            source.write_text(
+                "1\n00:00:00,000 --> 00:00:01,000\n正常内容\n", encoding="utf-8"
+            )
+            prepared = subtitle_pipeline.prepare_hallucination_cleanup(source, folder)
+            with self.assertRaises(ValueError):
+                subtitle_pipeline.complete_hallucination_cleanup(prepared, {0})
+
     def test_build_output_paths_preserves_unicode_filename(self):
         outputs = subtitle_pipeline.build_output_paths("動画 01.mp4", "字幕")
         self.assertEqual(outputs.first_pass, Path("字幕") / "動画 01_A.srt")

@@ -109,6 +109,35 @@ class ManualSubtitleMergeOutput:
     conflict_count: int
 
 
+@dataclass(frozen=True)
+class SuspiciousSubtitle:
+    """A subtitle marked for human review, with its nearby context."""
+
+    entry_index: int
+    entry: SubtitleEntry
+    reasons: tuple[str, ...]
+    previous_entry: SubtitleEntry | None
+    next_entry: SubtitleEntry | None
+
+
+@dataclass(frozen=True)
+class PreparedHallucinationCleanup:
+    """Source subtitles and the possible hallucinations that need review."""
+
+    source_subtitle: Path
+    output_path: Path
+    entries: tuple[SubtitleEntry, ...]
+    candidates: tuple[SuspiciousSubtitle, ...]
+
+
+@dataclass(frozen=True)
+class HallucinationCleanupOutput:
+    """A subtitle file created after the user confirms candidate deletions."""
+
+    output_path: Path
+    removed_count: int
+
+
 def build_output_paths(video_path: str | Path, output_dir: str | Path) -> SubtitleOutputs:
     """Return predictable, Unicode-safe output names for a video."""
     stem = Path(video_path).stem
@@ -149,6 +178,14 @@ def build_manual_merge_path(
     subtitle_a = Path(subtitle_a_path)
     subtitle_b = Path(subtitle_b_path)
     return Path(output_dir) / f"{subtitle_a.stem}_{subtitle_b.stem}_merged.srt"
+
+
+def build_hallucination_cleanup_path(
+    subtitle_path: str | Path, output_dir: str | Path
+) -> Path:
+    """Return the non-destructive output name used by the hallucination review."""
+    source = Path(subtitle_path)
+    return Path(output_dir) / f"{source.stem}_cleaned.srt"
 
 
 def _log(callback: LogCallback | None, message: str) -> None:
@@ -539,6 +576,94 @@ def complete_manual_subtitle_merge(
     return ManualSubtitleMergeOutput(
         output_path=prepared.output_path,
         conflict_count=len(prepared.conflicts),
+    )
+
+
+# These are review signals, not automatic deletion rules.  Their intent is to
+# surface boilerplate that Whisper sometimes invents around music or endings.
+HALLUCINATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "BGM／音乐标记",
+        re.compile(
+            r"^[\s♪♫]*[（(]?\s*[♪♫]?\s*(?:bgm|music|音楽)\s*[）)]?\s*$",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "片尾／结束标记",
+        re.compile(r"^[\s♪♫]*[（(]?\s*(?:エンディング|ending|end)\s*[）)]?\s*$", re.IGNORECASE),
+    ),
+    (
+        "感谢观看／片尾致谢",
+        re.compile(
+            r"(?:ご視聴(?:いただき)?ありがとうございました|"
+            r"ご覧(?:いただき)?ありがとうございました|"
+            r"感谢观看|感謝觀看|thanks\s+for\s+watching)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "订阅引导／片尾提示",
+        re.compile(r"(?:チャンネル登録|subscribe\s*(?:to|for)?)", re.IGNORECASE),
+    ),
+)
+
+
+def _hallucination_reasons(text: str) -> tuple[str, ...]:
+    """Return the human-readable review reasons matched by one subtitle."""
+    return tuple(label for label, pattern in HALLUCINATION_PATTERNS if pattern.search(text))
+
+
+def prepare_hallucination_cleanup(
+    subtitle_path: str | Path, output_dir: str | Path
+) -> PreparedHallucinationCleanup:
+    """Find possible boilerplate hallucinations while keeping the source untouched."""
+    source = Path(subtitle_path).expanduser().resolve()
+    if not source.is_file() or source.suffix.lower() != ".srt":
+        raise ValueError("请选择有效的 .srt 字幕文件。")
+    destination = Path(output_dir).expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    entries = _read_srt_entries(source)
+    candidates: list[SuspiciousSubtitle] = []
+    for entry_index, entry in enumerate(entries):
+        reasons = _hallucination_reasons(entry[2])
+        if reasons:
+            candidates.append(
+                SuspiciousSubtitle(
+                    entry_index=entry_index,
+                    entry=entry,
+                    reasons=reasons,
+                    previous_entry=entries[entry_index - 1] if entry_index else None,
+                    next_entry=(
+                        entries[entry_index + 1]
+                        if entry_index + 1 < len(entries)
+                        else None
+                    ),
+                )
+            )
+    return PreparedHallucinationCleanup(
+        source_subtitle=source,
+        output_path=build_hallucination_cleanup_path(source, destination),
+        entries=tuple(entries),
+        candidates=tuple(candidates),
+    )
+
+
+def complete_hallucination_cleanup(
+    prepared: PreparedHallucinationCleanup, delete_indices: set[int]
+) -> HallucinationCleanupOutput:
+    """Write a new SRT after deleting only candidate entries confirmed by the user."""
+    candidate_indices = {candidate.entry_index for candidate in prepared.candidates}
+    invalid_indices = delete_indices - candidate_indices
+    if invalid_indices:
+        raise ValueError("只能删除审核窗口中列出的可疑字幕。")
+    kept_entries = [
+        entry for index, entry in enumerate(prepared.entries) if index not in delete_indices
+    ]
+    write_srt(kept_entries, str(prepared.output_path))
+    return HallucinationCleanupOutput(
+        output_path=prepared.output_path,
+        removed_count=len(delete_indices),
     )
 
 
