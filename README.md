@@ -8,7 +8,7 @@
 
 ## 使用图形界面
 
-先安装依赖（只需一次）：
+请使用 Python 3.11 或更高版本，并先安装依赖（只需一次）：
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -70,7 +70,17 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 ### 从链接下载 MP4
 
-选择“下载 MP4”模式，输入视频链接并选择保存文件夹。程序会在该文件夹中运行 `python -m yt_dlp -c -R infinite --retry-sleep 5 --http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"`，下载日志会显示在窗口底部。
+选择“下载 MP4”模式，输入视频链接并选择保存文件夹。程序会优先选择 H.264/AAC 的 MP4，并在网络短暂中断时最多重试 10 次；下载日志会显示在窗口底部。
+
+YouTube 目前会要求 `yt-dlp` 使用 JavaScript 运行时。安装依赖时，`yt-dlp[default]` 会同时安装 EJS 解题脚本；还需要在系统 `PATH` 中安装 [Deno 2.3+](https://docs.deno.com/runtime/getting_started/installation/)（推荐）或 [Node.js 22+](https://nodejs.org/en/download/)。程序启动下载时会自动检测并启用可用运行时。
+
+`yt-dlp` 需要随 YouTube 的变更保持更新；尤其是出现下载错误时，请在项目目录运行：
+
+```powershell
+python -m pip install --upgrade "yt-dlp[default]"
+```
+
+若日志出现 HTTP 429 或“Sign in to confirm you’re not a bot”，请先在同一台电脑、同一网络的 Chrome、Edge、Firefox、Brave 或 Safari 中登录 YouTube；若出现验证码也先完成验证。然后在下载界面的“登录 Cookie”选择该浏览器并重试。程序仅让 `yt-dlp` 临时读取本机 Cookie，不会导出或保存它们；请不要把 Cookie 文件或浏览器配置文件分享给他人。
 
 ## 终端运行（可选）
 

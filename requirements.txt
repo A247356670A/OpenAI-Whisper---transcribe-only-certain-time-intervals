@@ -7,7 +7,7 @@ torch
 tkinterdnd2
 
 # Link-based MP4 downloads in the GUI
-yt-dlp
+yt-dlp[default]
 
 # Optional dialogue detection for B audio pre-filtering
 webrtcvad-wheels
