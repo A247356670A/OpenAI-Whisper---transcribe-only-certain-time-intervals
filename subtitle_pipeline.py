@@ -30,6 +30,13 @@ from whisper_options import build_whisper_options
 LogCallback = Callable[[str], None]
 
 
+# Browser names accepted by yt-dlp's --cookies-from-browser option.  The GUI
+# passes one of these identifiers only; it never exports or stores cookies.
+SUPPORTED_COOKIE_BROWSERS = frozenset(
+    {"brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi"}
+)
+
+
 # Conservative B-pass audio gate: only near-silent gaps are skipped.  Spoken
 # dialogue and music are deliberately retained for Whisper to avoid omissions.
 B_AUDIO_MIN_RMS = 0.001
@@ -766,13 +773,56 @@ def _ffmpeg_filter_filename(path: Path) -> str:
     )
 
 
+def _find_yt_dlp_js_runtime() -> tuple[str, str] | None:
+    """Return the preferred installed JavaScript runtime for yt-dlp EJS.
+
+    Deno is yt-dlp's recommended runtime.  Node and QuickJS are useful
+    fallbacks on computers where they are already available.  The actual
+    executable remains on PATH, which keeps the command portable between
+    Windows and macOS.
+    """
+    for executable, runtime, label in (
+        ("deno", "deno", "Deno"),
+        ("node", "node", "Node.js"),
+        ("qjs", "quickjs", "QuickJS"),
+    ):
+        if shutil.which(executable):
+            return runtime, label
+    return None
+
+
+def _download_failure_message(output_lines: list[str]) -> str:
+    """Turn common yt-dlp/YouTube failures into a useful GUI error."""
+    output = "\n".join(output_lines).lower()
+    if (
+        "sign in to confirm you’re not a bot" in output
+        or "sign in to confirm you're not a bot" in output
+    ):
+        return (
+            "YouTube 要求进行真人验证，未能下载。请在本机浏览器登录 YouTube，"
+            "如页面出现验证码请先完成验证；然后在“登录 Cookie”选择该浏览器后重试。"
+        )
+    if "http error 429" in output or "too many requests" in output:
+        return (
+            "YouTube 暂时限制了当前网络的请求（HTTP 429）。请在同一浏览器完成验证码，"
+            "在下载界面选择已登录的浏览器 Cookie 后重试；仍失败时请稍后再试。"
+        )
+    if "no supported javascript runtime" in output:
+        return (
+            "yt-dlp 缺少 YouTube 所需的 JavaScript 运行时。请安装 Deno 2.3+"
+            "（推荐）或 Node.js 22+，重启程序后重试。"
+        )
+    return "yt-dlp 下载失败。请查看运行日志中的错误信息。"
+
+
 def download_video_as_mp4(
     link: str,
     output_dir: str | Path,
     *,
+    cookie_browser: str | None = None,
     log_callback: LogCallback | None = None,
 ) -> DownloadedVideoOutput:
-    """Download *link* as MP4 with the project's selected yt-dlp command."""
+    """Download *link* as MP4 with optional local browser authentication."""
     source_url = link.strip()
     if not source_url:
         raise ValueError("请输入视频链接。")
@@ -786,13 +836,19 @@ def download_video_as_mp4(
             "缺少 yt-dlp。请在项目目录执行：\npython -m pip install -r requirements.txt"
         ) from exc
 
+    browser = cookie_browser.strip().lower() if cookie_browser else None
+    if browser and browser not in SUPPORTED_COOKIE_BROWSERS:
+        raise ValueError(
+            "不支持的浏览器 Cookie 来源。请选择 Chrome、Edge、Firefox 等浏览器。"
+        )
+
     command = [
         sys.executable,
         "-m",
         "yt_dlp",
         "-c",
         "-R",
-        "infinite",
+        "10",
         "--retry-sleep",
         "5",
         "--http-chunk-size",
@@ -801,14 +857,37 @@ def download_video_as_mp4(
         "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[ext=mp4]",
         "--merge-output-format",
         "mp4",
-        source_url,
     ]
+    if browser:
+        command.extend(["--cookies-from-browser", browser])
+
+    js_runtime = _find_yt_dlp_js_runtime()
+    if js_runtime:
+        command.extend(["--js-runtimes", js_runtime[0]])
+    command.append(source_url)
     _log(
         log_callback,
-        '正在保存到目标文件夹：python -m yt_dlp -c -R infinite --retry-sleep 5 '
+        '正在保存到目标文件夹：python -m yt_dlp -c -R 10 --retry-sleep 5 '
         '--http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+'
         'ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"',
     )
+    if browser:
+        _log(
+            log_callback,
+            f"已启用 {browser.title()} 的本机登录 Cookie（不会导出或保存 Cookie）。",
+        )
+    else:
+        _log(
+            log_callback,
+            "未使用浏览器 Cookie；若 YouTube 要求验证，请选择已登录 YouTube 的浏览器后重试。",
+        )
+    if js_runtime:
+        _log(log_callback, f"已启用 yt-dlp JavaScript 运行时：{js_runtime[1]}。")
+    else:
+        _log(
+            log_callback,
+            "未检测到 Deno、Node.js 或 QuickJS；YouTube 可能缺少部分格式或无法下载。",
+        )
     process = subprocess.Popen(
         command,
         cwd=str(destination),
@@ -818,13 +897,15 @@ def download_video_as_mp4(
         encoding="utf-8",
         errors="replace",
     )
+    output_lines: list[str] = []
     if process.stdout:
         for line in process.stdout:
             line = line.strip()
             if line:
+                output_lines.append(line)
                 _log(log_callback, line)
     if process.wait() != 0:
-        raise RuntimeError("yt-dlp 下载失败。请查看运行日志中的错误信息。")
+        raise RuntimeError(_download_failure_message(output_lines))
     _log(log_callback, f"完成：视频已保存到 {destination}")
     return DownloadedVideoOutput(source_url=source_url, output_dir=destination)
 

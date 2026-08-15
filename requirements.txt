@@ -7,4 +7,4 @@ torch
 tkinterdnd2
 
 # Link-based MP4 downloads in the GUI
-yt-dlp
+yt-dlp[default]

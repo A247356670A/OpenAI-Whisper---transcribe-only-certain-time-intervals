@@ -168,6 +168,7 @@ class SubtitlePipelineTests(unittest.TestCase):
             folder = Path(temporary_directory)
             with (
                 patch.dict("sys.modules", {"yt_dlp": object()}),
+                patch("subtitle_pipeline.shutil.which", return_value=None),
                 patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
             ):
                 output = subtitle_pipeline.download_video_as_mp4(
@@ -178,11 +179,67 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(output.output_dir, folder)
             self.assertEqual(output.source_url, "https://example.test/watch?v=123")
             self.assertEqual(popen.call_args.kwargs["cwd"], str(folder))
-            self.assertEqual(command[command.index("-R") + 1], "infinite")
+            self.assertEqual(command[command.index("-R") + 1], "10")
             self.assertEqual(command[command.index("--retry-sleep") + 1], "5")
             self.assertEqual(command[command.index("--http-chunk-size") + 1], "1M")
             self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
             self.assertEqual(command[-1], "https://example.test/watch?v=123")
+            self.assertNotIn("--cookies-from-browser", command)
+            self.assertNotIn("--js-runtimes", command)
+
+    def test_download_video_as_mp4_passes_browser_cookie_and_node_runtime(self):
+        class _FakeProcess:
+            stdout = []
+
+            @staticmethod
+            def wait():
+                return 0
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            with (
+                patch.dict("sys.modules", {"yt_dlp": object()}),
+                patch(
+                    "subtitle_pipeline.shutil.which",
+                    side_effect=lambda executable: "/mock/node"
+                    if executable == "node"
+                    else None,
+                ),
+                patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()) as popen,
+            ):
+                subtitle_pipeline.download_video_as_mp4(
+                    "https://example.test/watch?v=123",
+                    folder,
+                    cookie_browser="chrome",
+                )
+
+            command = popen.call_args.args[0]
+            self.assertEqual(
+                command[command.index("--cookies-from-browser") + 1], "chrome"
+            )
+            self.assertEqual(command[command.index("--js-runtimes") + 1], "node")
+
+    def test_download_video_as_mp4_explains_youtube_bot_check(self):
+        class _FakeProcess:
+            stdout = [
+                "ERROR: Sign in to confirm you're not a bot. Use --cookies-from-browser"
+            ]
+
+            @staticmethod
+            def wait():
+                return 1
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            with (
+                patch.dict("sys.modules", {"yt_dlp": object()}),
+                patch("subtitle_pipeline.shutil.which", return_value=None),
+                patch("subtitle_pipeline.subprocess.Popen", return_value=_FakeProcess()),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "真人验证"):
+                    subtitle_pipeline.download_video_as_mp4(
+                        "https://example.test/watch?v=123", folder
+                    )
 
     def test_manual_subtitle_merge_groups_overlaps_and_uses_selected_side(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

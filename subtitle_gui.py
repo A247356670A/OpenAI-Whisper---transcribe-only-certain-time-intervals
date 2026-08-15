@@ -47,6 +47,15 @@ VIDEO_FILE_TYPES = [
     ("所有文件", "*.*"),
 ]
 
+DOWNLOAD_COOKIE_BROWSER_LABELS = {
+    "不使用浏览器 Cookie": None,
+    "Chrome（已登录 YouTube）": "chrome",
+    "Edge（已登录 YouTube）": "edge",
+    "Firefox（已登录 YouTube）": "firefox",
+    "Brave（已登录 YouTube）": "brave",
+    "Safari（已登录 YouTube）": "safari",
+}
+
 
 def enable_high_dpi_awareness() -> None:
     """Ask Windows to render the Tk window at the monitor's native DPI."""
@@ -400,6 +409,9 @@ class SubtitleApp:
         self.subtitle_a_path = tk.StringVar()
         self.subtitle_b_path = tk.StringVar()
         self.download_link = tk.StringVar()
+        self.download_cookie_browser = tk.StringVar(
+            value="不使用浏览器 Cookie"
+        )
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
         self.model_name = tk.StringVar(value="large-v2")
@@ -591,6 +603,24 @@ class SubtitleApp:
         self.link_entry = ttk.Entry(self.link_row, textvariable=self.download_link)
         self.link_entry.pack(side="left", fill="x", expand=True)
 
+        self.download_cookie_row = ttk.Frame(self.input_area)
+        ttk.Label(self.download_cookie_row, text="登录 Cookie", width=10).pack(
+            side="left"
+        )
+        self.download_cookie_box = ttk.Combobox(
+            self.download_cookie_row,
+            state="readonly",
+            textvariable=self.download_cookie_browser,
+            values=tuple(DOWNLOAD_COOKIE_BROWSER_LABELS),
+            width=28,
+        )
+        self.download_cookie_box.pack(side="left")
+        ttk.Label(
+            self.download_cookie_row,
+            text="遇到 YouTube 验证时，选择本机已登录的浏览器。",
+            style="Hint.TLabel",
+        ).pack(side="left", padx=(10, 0))
+
         self.output_row = ttk.Frame(self.root)
         self.output_row.pack(fill="x", pady=7)
         ttk.Label(self.output_row, text="保存位置", width=10).pack(side="left")
@@ -686,6 +716,7 @@ class SubtitleApp:
             self.threshold_entry.configure(state="disabled")
         elif mode == "download_mp4":
             self.link_row.pack(fill="x", pady=(0, 7))
+            self.download_cookie_row.pack(fill="x", pady=(0, 7))
             self.threshold_entry.configure(state="disabled")
         elif mode == "merge_subtitles":
             self.subtitle_label.configure(text="字幕 A")
@@ -868,7 +899,8 @@ class SubtitleApp:
             self.output_preview.set(
                 "将以 yt-dlp 下载兼容 MP4 视频\n"
                 f"链接：{self.download_link.get().strip()}\n"
-                f"保存位置：{self.output_dir.get()}"
+                f"保存位置：{self.output_dir.get()}\n"
+                f"登录 Cookie：{self.download_cookie_browser.get()}"
             )
             return
         if mode == "split_chinese":
@@ -942,6 +974,9 @@ class SubtitleApp:
         subtitle_a = self.subtitle_a_path.get().strip()
         subtitle_b = self.subtitle_b_path.get().strip()
         download_link = self.download_link.get().strip()
+        cookie_browser = DOWNLOAD_COOKIE_BROWSER_LABELS.get(
+            self.download_cookie_browser.get()
+        )
         output = self.output_dir.get().strip()
         mode = self.run_mode.get()
         if mode not in (
@@ -1060,6 +1095,7 @@ class SubtitleApp:
                 video,
                 subtitle_a,
                 download_link,
+                cookie_browser,
                 output,
                 self.model_name.get(),
                 merge_gap,
@@ -1140,6 +1176,7 @@ class SubtitleApp:
         video: str,
         subtitle_a: str,
         download_link: str,
+        cookie_browser: str | None,
         output: str,
         model_name: str,
         merge_gap: float,
@@ -1187,6 +1224,7 @@ class SubtitleApp:
                     result = download_video_as_mp4(
                         download_link,
                         output,
+                        cookie_browser=cookie_browser,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
                 else:
