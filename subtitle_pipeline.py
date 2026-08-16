@@ -276,12 +276,22 @@ def _import_dependencies():
 
 
 def _reserve_cpu_for_gui(torch: Any) -> None:
-    """Avoid letting CPU-only Whisper consume every core needed by Tk."""
+    """Avoid letting CPU-only Whisper starve Tk's event loop.
+
+    macOS schedules Tk, CoreText and window-server work alongside CPU-only
+    Whisper kernels. Keeping a larger headroom there improves click and redraw
+    responsiveness on Apple Silicon, while Windows retains its current setting.
+    """
     cpu_count = os.cpu_count() or 1
     if cpu_count < 2:
         return
+    worker_threads = max(1, cpu_count - 1)
+    if sys.platform == "darwin":
+        # Reserve enough cores for Tk and the desktop while keeping practical
+        # transcription throughput on common Mac configurations.
+        worker_threads = min(6, max(1, cpu_count - 2))
     try:
-        torch.set_num_threads(max(1, cpu_count - 1))
+        torch.set_num_threads(worker_threads)
     except (AttributeError, RuntimeError):
         # Some Torch builds do not allow changing this after initialization.
         pass

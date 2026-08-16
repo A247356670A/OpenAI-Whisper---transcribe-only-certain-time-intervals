@@ -54,6 +54,25 @@ class _FakeLibrosa:
 
 
 class SubtitlePipelineTests(unittest.TestCase):
+    def test_cpu_thread_reservation_keeps_extra_macos_headroom(self):
+        class _FakeTorch:
+            def __init__(self):
+                self.thread_count = None
+
+            def set_num_threads(self, count):
+                self.thread_count = count
+
+        mac_torch = _FakeTorch()
+        windows_torch = _FakeTorch()
+        with patch("subtitle_pipeline.os.cpu_count", return_value=10):
+            with patch("subtitle_pipeline.sys.platform", "darwin"):
+                subtitle_pipeline._reserve_cpu_for_gui(mac_torch)
+            with patch("subtitle_pipeline.sys.platform", "win32"):
+                subtitle_pipeline._reserve_cpu_for_gui(windows_torch)
+
+        self.assertEqual(mac_torch.thread_count, 6)
+        self.assertEqual(windows_torch.thread_count, 9)
+
     def test_whisper_options_are_converted_from_gui_values(self):
         values = default_option_values("second")
         values.update(

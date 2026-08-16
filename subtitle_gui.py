@@ -52,6 +52,8 @@ VIDEO_FILE_TYPES = [
     ("所有文件", "*.*"),
 ]
 
+IS_MACOS = sys.platform == "darwin"
+
 B_AUDIO_FILTER_PRESETS = {
     "仅跳过完全静音（推荐）": ("0.0001", "0.05", "45"),
     "平衡": ("0.001", "0.25", "35"),
@@ -418,6 +420,12 @@ class SubtitleApp:
 
         self.events: Queue[tuple[str, object]] = Queue()
         self.running = False
+        # Tk's text widget is more sensitive to large, frequent inserts on
+        # macOS. Smaller batches let AppKit process clicks and redraws between
+        # log updates; retain the established Windows cadence unchanged.
+        self.event_batch_size = 24 if IS_MACOS else 80
+        self.event_backlog_delay_ms = 16 if IS_MACOS else 30
+        self.event_idle_delay_ms = 80 if IS_MACOS else 120
         self.video_path = tk.StringVar()
         self.subtitle_a_path = tk.StringVar()
         self.subtitle_b_path = tk.StringVar()
@@ -468,8 +476,10 @@ class SubtitleApp:
             style.theme_use("vista")
         except tk.TclError:
             pass
-        # Tk's default font can look soft on scaled Windows displays.  Use the
-        # ClearType-aware UI font consistently for labels, buttons and inputs.
+        # Use the platform's native CJK UI font. This avoids repeated fallback
+        # resolution on macOS while preserving the Windows font configuration.
+        ui_font = "PingFang SC" if IS_MACOS else "Microsoft YaHei UI"
+        fixed_font = "Menlo" if IS_MACOS else "Consolas"
         for font_name in (
             "TkDefaultFont",
             "TkTextFont",
@@ -480,18 +490,18 @@ class SubtitleApp:
         ):
             try:
                 tkfont.nametofont(font_name).configure(
-                    family="Microsoft YaHei UI", size=14
+                    family=ui_font, size=14
                 )
             except tk.TclError:
                 pass
         try:
             tkfont.nametofont("TkFixedFont").configure(
-                family="Consolas", size=14
+                family=fixed_font, size=14
             )
         except tk.TclError:
             pass
 
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 23, "bold"))
+        style.configure("Title.TLabel", font=(ui_font, 23, "bold"))
         style.configure("Hint.TLabel", foreground="#5b6472")
         style.configure("Drop.TLabel", anchor="center", padding=12, relief="solid")
 
@@ -1613,7 +1623,7 @@ class SubtitleApp:
         try:
             # Do not drain an endlessly growing FFmpeg/Whisper log queue in one
             # Tk callback: that starves click and repaint events on busy runs.
-            while processed < 80:
+            while processed < self.event_batch_size:
                 event_type, payload = self.events.get_nowait()
                 processed += 1
                 if event_type == "log":
@@ -1691,7 +1701,12 @@ class SubtitleApp:
             pass
         self._append_log_batch(log_messages)
         # Continue quickly while there is a backlog, but remain light when idle.
-        self.root.after(30 if processed == 80 else 120, self._consume_events)
+        self.root.after(
+            self.event_backlog_delay_ms
+            if processed == self.event_batch_size
+            else self.event_idle_delay_ms,
+            self._consume_events,
+        )
 
     def _append_log(self, message: str) -> None:
         self._append_log_batch([message])

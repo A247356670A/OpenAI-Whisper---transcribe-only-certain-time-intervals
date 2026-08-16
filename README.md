@@ -8,13 +8,47 @@
 
 ## 使用图形界面
 
-请使用 Python 3.11 或更高版本，并先安装依赖（只需一次）：
+请使用 Python 3.11 或更高版本。克隆项目后，先在项目目录完成以下一次性安装。
+
+### macOS（Homebrew）
+
+烧录和预览字幕需要 FFmpeg 的 `subtitles` 滤镜，而这个滤镜依赖 `libass`。Homebrew 的普通 `ffmpeg` 不包含它，因此请安装完整版本：
+
+```zsh
+brew install ffmpeg-full
+brew link --overwrite --force ffmpeg-full
+python -m pip install -r requirements.txt
+```
+
+如果之前安装过普通版 `ffmpeg`，先执行 `brew unlink ffmpeg`，再执行上面的 `brew link` 命令。安装后可验证：
+
+```zsh
+ffmpeg -hide_banner -filters | grep subtitles
+```
+
+输出中出现 `subtitles` 才表示可以预览和烧录字幕。若用双击方式启动程序，请在安装后完全退出并重新打开程序。
+
+### Windows
+
+1. 从 [FFmpeg 下载页](https://ffmpeg.org/download.html) 获取**完整构建版** FFmpeg，解压到固定位置，例如 `C:\ffmpeg`。必须使用包含 `libass` 的构建，否则无法预览或烧录字幕。
+2. 将 `C:\ffmpeg\bin` 加入 Windows 的系统 `PATH`，重新打开 PowerShell 或重新登录系统。
+3. 在项目目录打开 PowerShell，安装 Python 依赖：
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-还需要安装 [FFmpeg](https://ffmpeg.org/download.html) 并将其加入系统 `PATH`。
+4. 验证 FFmpeg：
+
+```powershell
+ffmpeg -hide_banner -filters | Select-String subtitles
+```
+
+输出中出现 `subtitles` 才表示可以预览和烧录字幕。
+
+### Linux / 其他系统
+
+安装包含 `libass` 的完整 FFmpeg 发行版并将其加入 `PATH`，然后执行 `python -m pip install -r requirements.txt`。可用 `ffmpeg -hide_banner -filters | grep subtitles` 验证。
 
 随后双击或运行：
 
