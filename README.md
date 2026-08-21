@@ -64,6 +64,12 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 识别会在后台进行，运行日志会显示在窗口下方，因此界面不会卡死。拖放功能由 `tkinterdnd2` 提供；该包已在 `requirements.txt` 中列出。
 
+### 应用设置与完成提示
+
+点击窗口右上角的“应用设置…”可开启或关闭任务成功后的提示音，并选择系统提示音或自定义音频文件。macOS 支持常见音频格式；Windows 的自定义提示音请使用 `.wav`。同一页面还可调整界面字体大小、浅色/深色主题和主题色；设置会保存到用户目录，下次启动自动恢复。字幕样式预览、字幕处理、MP4 烧录和 MP4 下载成功后都会触发提示音。
+
+“转写性能”默认是“平衡（界面优先）”，在 macOS 上会保留更多 CPU 给界面，减少点击卡顿；选择“性能优先”会使用更多 CPU 线程来缩短识别时间，但处理期间界面可能稍有迟滞。Windows 保持原有线程策略。终端运行默认使用性能优先，也可以用 `--cpu-thread-profile balanced` 改为平衡模式。
+
 ### 仅生成字幕 A
 
 选择 GUI 中的“仅生成字幕 A”模式并提供原视频。程序只执行完整视频的第一轮日语识别，输出 `视频名_A.srt`，不会生成 B 或合并字幕。
@@ -104,7 +110,7 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 ### 从链接下载 MP4
 
-选择“下载 MP4”模式，输入视频链接并选择保存文件夹。程序会优先选择 H.264/AAC 的 MP4，并在网络短暂中断时最多重试 10 次；下载日志会显示在窗口底部。
+选择“下载 MP4”模式，输入视频链接并选择保存文件夹。程序会优先选择 H.264/AAC 的 MP4，并在网络短暂中断时最多重试 10 次；同时下载视频封面并转换为与视频同名的 JPG 图片。下载日志会显示在窗口底部。
 
 YouTube 目前会要求 `yt-dlp` 使用 JavaScript 运行时。安装依赖时，`yt-dlp[default]` 会同时安装 EJS 解题脚本；还需要在系统 `PATH` 中安装 [Deno 2.3+](https://docs.deno.com/runtime/getting_started/installation/)（推荐）或 [Node.js 22+](https://nodejs.org/en/download/)。程序启动下载时会自动检测并启用可用运行时。
 

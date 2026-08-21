@@ -8,6 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import subtitle_pipeline
+import subtitle_gui
 from whisper_options import build_whisper_options, default_option_values
 from split_audio_by_intervals import split_audio_by_intervals
 
@@ -54,6 +55,35 @@ class _FakeLibrosa:
 
 
 class SubtitlePipelineTests(unittest.TestCase):
+    def test_app_settings_round_trip_and_reject_invalid_values(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            settings_path = Path(temporary_directory) / "settings.json"
+            subtitle_gui.save_app_settings(
+                {
+                    "notification_enabled": False,
+                    "notification_sound": "自定义音频",
+                    "notification_sound_path": "/tmp/done.wav",
+                    "ui_font_size": 18,
+                    "ui_theme": "深色",
+                    "accent_color": "紫色",
+                    "cpu_thread_profile": "performance",
+                    "unknown_future_setting": "ignored",
+                },
+                settings_path,
+            )
+            settings = subtitle_gui.load_app_settings(settings_path)
+
+            self.assertFalse(settings["notification_enabled"])
+            self.assertEqual(settings["ui_font_size"], 18)
+            self.assertEqual(settings["ui_theme"], "深色")
+            self.assertEqual(settings["accent_color"], "紫色")
+            self.assertEqual(settings["cpu_thread_profile"], "performance")
+
+            settings_path.write_text('{"ui_font_size": 100, "ui_theme": "无效"}', encoding="utf-8")
+            recovered = subtitle_gui.load_app_settings(settings_path)
+            self.assertEqual(recovered["ui_font_size"], 14)
+            self.assertEqual(recovered["ui_theme"], "浅色")
+
     def test_cpu_thread_reservation_keeps_extra_macos_headroom(self):
         class _FakeTorch:
             def __init__(self):
@@ -63,14 +93,19 @@ class SubtitlePipelineTests(unittest.TestCase):
                 self.thread_count = count
 
         mac_torch = _FakeTorch()
+        mac_performance_torch = _FakeTorch()
         windows_torch = _FakeTorch()
         with patch("subtitle_pipeline.os.cpu_count", return_value=10):
             with patch("subtitle_pipeline.sys.platform", "darwin"):
                 subtitle_pipeline._reserve_cpu_for_gui(mac_torch)
+                subtitle_pipeline._reserve_cpu_for_gui(
+                    mac_performance_torch, "performance"
+                )
             with patch("subtitle_pipeline.sys.platform", "win32"):
                 subtitle_pipeline._reserve_cpu_for_gui(windows_torch)
 
         self.assertEqual(mac_torch.thread_count, 6)
+        self.assertEqual(mac_performance_torch.thread_count, 9)
         self.assertEqual(windows_torch.thread_count, 9)
 
     def test_whisper_options_are_converted_from_gui_values(self):
@@ -265,6 +300,8 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(command[command.index("--retry-sleep") + 1], "5")
             self.assertEqual(command[command.index("--http-chunk-size") + 1], "1M")
             self.assertEqual(command[command.index("--merge-output-format") + 1], "mp4")
+            self.assertIn("--write-thumbnail", command)
+            self.assertEqual(command[command.index("--convert-thumbnails") + 1], "jpg")
             self.assertEqual(command[-1], "https://example.test/watch?v=123")
             self.assertNotIn("--cookies-from-browser", command)
             self.assertNotIn("--js-runtimes", command)

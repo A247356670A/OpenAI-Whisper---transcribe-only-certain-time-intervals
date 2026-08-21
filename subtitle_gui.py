@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import json
 import os
 from pathlib import Path
 from queue import Empty, Queue
 import random
 import re
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -54,6 +56,32 @@ VIDEO_FILE_TYPES = [
 
 IS_MACOS = sys.platform == "darwin"
 
+APP_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_settings.json"
+DEFAULT_APP_SETTINGS = {
+    "notification_enabled": True,
+    "notification_sound": "系统提示音",
+    "notification_sound_path": "",
+    "ui_font_size": 14,
+    "ui_theme": "浅色",
+    "accent_color": "蓝色",
+    "cpu_thread_profile": "balanced",
+}
+UI_THEME_CHOICES = ("浅色", "深色")
+ACCENT_COLOR_CHOICES = ("蓝色", "绿色", "紫色", "橙色")
+ACCENT_COLORS = {
+    "蓝色": "#2563eb",
+    "绿色": "#15803d",
+    "紫色": "#7c3aed",
+    "橙色": "#c2410c",
+}
+CPU_THREAD_PROFILE_LABELS = {
+    "平衡（界面优先）": "balanced",
+    "性能优先": "performance",
+}
+CPU_THREAD_PROFILE_LABELS_REVERSED = {
+    value: label for label, value in CPU_THREAD_PROFILE_LABELS.items()
+}
+
 B_AUDIO_FILTER_PRESETS = {
     "仅跳过完全静音（推荐）": ("0.0001", "0.05", "45"),
     "平衡": ("0.001", "0.25", "35"),
@@ -70,6 +98,37 @@ DOWNLOAD_COOKIE_BROWSER_LABELS = {
     "Brave（已登录 YouTube）": "brave",
     "Safari（已登录 YouTube）": "safari",
 }
+
+
+def load_app_settings(path: Path = APP_SETTINGS_PATH) -> dict[str, object]:
+    """Load saved UI preferences without letting a malformed file stop the app."""
+    settings = DEFAULT_APP_SETTINGS.copy()
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return settings
+    if not isinstance(loaded, dict):
+        return settings
+    for key, default in DEFAULT_APP_SETTINGS.items():
+        value = loaded.get(key, default)
+        if isinstance(value, type(default)):
+            settings[key] = value
+    if settings["ui_theme"] not in UI_THEME_CHOICES:
+        settings["ui_theme"] = DEFAULT_APP_SETTINGS["ui_theme"]
+    if settings["accent_color"] not in ACCENT_COLOR_CHOICES:
+        settings["accent_color"] = DEFAULT_APP_SETTINGS["accent_color"]
+    if settings["cpu_thread_profile"] not in CPU_THREAD_PROFILE_LABELS_REVERSED:
+        settings["cpu_thread_profile"] = DEFAULT_APP_SETTINGS["cpu_thread_profile"]
+    if not 10 <= int(settings["ui_font_size"]) <= 24:
+        settings["ui_font_size"] = DEFAULT_APP_SETTINGS["ui_font_size"]
+    return settings
+
+
+def save_app_settings(settings: dict[str, object], path: Path = APP_SETTINGS_PATH) -> None:
+    """Persist only known preferences so future versions can evolve safely."""
+    payload = {key: settings.get(key, default) for key, default in DEFAULT_APP_SETTINGS.items()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def enable_high_dpi_awareness() -> None:
@@ -204,6 +263,156 @@ class WhisperOptionsDialog:
     def _reset_values(pass_name: str, values: dict[str, tk.StringVar]) -> None:
         for key, value in default_option_values(pass_name).items():
             values[key].set(value)
+
+
+class AppSettingsDialog:
+    """Edit the app-wide appearance and completion-notification preferences."""
+
+    def __init__(self, app: "SubtitleApp") -> None:
+        self.app = app
+        self.window = tk.Toplevel(app.root)
+        self.window.title("应用设置")
+        self.window.geometry("700x500")
+        self.window.minsize(600, 440)
+        self.window.transient(app.root)
+        self.window.configure(padx=18, pady=15)
+
+        self.notification_enabled = tk.BooleanVar(value=app.notification_enabled.get())
+        self.notification_sound = tk.StringVar(value=app.notification_sound.get())
+        self.notification_sound_path = tk.StringVar(value=app.notification_sound_path.get())
+        self.ui_font_size = tk.StringVar(value=str(app.ui_font_size.get()))
+        self.ui_theme = tk.StringVar(value=app.ui_theme.get())
+        self.accent_color = tk.StringVar(value=app.accent_color.get())
+        self.cpu_thread_profile = tk.StringVar(
+            value=CPU_THREAD_PROFILE_LABELS_REVERSED[app.cpu_thread_profile.get()]
+        )
+
+        notification = ttk.LabelFrame(self.window, text="任务完成提示", padding=10)
+        notification.pack(fill="x")
+        ttk.Checkbutton(
+            notification,
+            text="任务成功完成后播放提示音",
+            variable=self.notification_enabled,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(notification, text="提示音").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Combobox(
+            notification,
+            textvariable=self.notification_sound,
+            values=("系统提示音", "自定义音频"),
+            state="readonly",
+            width=16,
+        ).grid(row=1, column=1, sticky="w", padx=(8, 12), pady=(10, 0))
+        ttk.Button(notification, text="试听", command=self._preview_sound).grid(
+            row=1, column=2, sticky="w", pady=(10, 0)
+        )
+        ttk.Label(notification, text="自定义文件").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(notification, textvariable=self.notification_sound_path).grid(
+            row=2, column=1, sticky="ew", padx=(8, 8), pady=(8, 0)
+        )
+        ttk.Button(notification, text="选择音频…", command=self._choose_sound).grid(
+            row=2, column=2, sticky="w", pady=(8, 0)
+        )
+        notification.columnconfigure(1, weight=1)
+        windows_hint = "Windows 自定义提示音支持 WAV；macOS 支持常见音频格式。"
+        ttk.Label(notification, text=windows_hint, style="Hint.TLabel").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(7, 0)
+        )
+
+        appearance = ttk.LabelFrame(self.window, text="界面外观", padding=10)
+        appearance.pack(fill="x", pady=(12, 0))
+        ttk.Label(appearance, text="界面字体大小").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(
+            appearance,
+            from_=10,
+            to=24,
+            textvariable=self.ui_font_size,
+            width=6,
+        ).grid(row=0, column=1, sticky="w", padx=(8, 26))
+        ttk.Label(appearance, text="主题").grid(row=0, column=2, sticky="w")
+        ttk.Combobox(
+            appearance,
+            textvariable=self.ui_theme,
+            values=UI_THEME_CHOICES,
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=3, sticky="w", padx=(8, 26))
+        ttk.Label(appearance, text="主题色").grid(row=0, column=4, sticky="w")
+        ttk.Combobox(
+            appearance,
+            textvariable=self.accent_color,
+            values=ACCENT_COLOR_CHOICES,
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=5, sticky="w", padx=(8, 0))
+        ttk.Label(appearance, text="转写性能").grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+        ttk.Combobox(
+            appearance,
+            textvariable=self.cpu_thread_profile,
+            values=tuple(CPU_THREAD_PROFILE_LABELS),
+            state="readonly",
+            width=18,
+        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(12, 0))
+        ttk.Label(
+            appearance,
+            text="性能优先会在 macOS 上使用更多 CPU 线程；处理时界面可能略有迟滞。",
+            style="Hint.TLabel",
+        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(16, 0), pady=(12, 0))
+
+        buttons = ttk.Frame(self.window)
+        buttons.pack(fill="x", pady=(18, 0))
+        ttk.Button(buttons, text="恢复默认", command=self._restore_defaults).pack(side="left")
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right")
+        ttk.Button(buttons, text="应用并保存", command=self._apply).pack(side="right", padx=(0, 8))
+
+    def _choose_sound(self) -> None:
+        file_types = [("音频文件", "*.wav *.mp3 *.m4a *.aac *.aiff *.aif *.caf"), ("所有文件", "*.*")]
+        selected = filedialog.askopenfilename(parent=self.window, title="选择任务完成提示音", filetypes=file_types)
+        if selected:
+            self.notification_sound_path.set(selected)
+            self.notification_sound.set("自定义音频")
+
+    def _preview_sound(self) -> None:
+        self.app._play_notification_sound(
+            self.notification_sound.get(), self.notification_sound_path.get()
+        )
+
+    def _restore_defaults(self) -> None:
+        self.notification_enabled.set(bool(DEFAULT_APP_SETTINGS["notification_enabled"]))
+        self.notification_sound.set(str(DEFAULT_APP_SETTINGS["notification_sound"]))
+        self.notification_sound_path.set(str(DEFAULT_APP_SETTINGS["notification_sound_path"]))
+        self.ui_font_size.set(str(DEFAULT_APP_SETTINGS["ui_font_size"]))
+        self.ui_theme.set(str(DEFAULT_APP_SETTINGS["ui_theme"]))
+        self.accent_color.set(str(DEFAULT_APP_SETTINGS["accent_color"]))
+        self.cpu_thread_profile.set(
+            CPU_THREAD_PROFILE_LABELS_REVERSED[
+                str(DEFAULT_APP_SETTINGS["cpu_thread_profile"])
+            ]
+        )
+
+    def _apply(self) -> None:
+        try:
+            font_size = int(self.ui_font_size.get())
+            if not 10 <= font_size <= 24:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("字体大小不正确", "界面字体大小请输入 10 到 24 之间的整数。", parent=self.window)
+            return
+        self.app._apply_app_settings(
+            {
+                "notification_enabled": self.notification_enabled.get(),
+                "notification_sound": self.notification_sound.get(),
+                "notification_sound_path": self.notification_sound_path.get().strip(),
+                "ui_font_size": font_size,
+                "ui_theme": self.ui_theme.get(),
+                "accent_color": self.accent_color.get(),
+                "cpu_thread_profile": CPU_THREAD_PROFILE_LABELS[
+                    self.cpu_thread_profile.get()
+                ],
+            }
+        )
+        self.window.destroy()
 
 
 class SubtitleConflictDialog:
@@ -418,6 +627,7 @@ class SubtitleApp:
         self.root.minsize(1100, 760)
         self.root.configure(padx=18, pady=14)
 
+        saved_settings = load_app_settings()
         self.events: Queue[tuple[str, object]] = Queue()
         self.running = False
         # Tk's text widget is more sensitive to large, frequent inserts on
@@ -432,6 +642,21 @@ class SubtitleApp:
         self.download_link = tk.StringVar()
         self.download_cookie_browser = tk.StringVar(
             value="不使用浏览器 Cookie"
+        )
+        self.notification_enabled = tk.BooleanVar(
+            value=bool(saved_settings["notification_enabled"])
+        )
+        self.notification_sound = tk.StringVar(
+            value=str(saved_settings["notification_sound"])
+        )
+        self.notification_sound_path = tk.StringVar(
+            value=str(saved_settings["notification_sound_path"])
+        )
+        self.ui_font_size = tk.IntVar(value=int(saved_settings["ui_font_size"]))
+        self.ui_theme = tk.StringVar(value=str(saved_settings["ui_theme"]))
+        self.accent_color = tk.StringVar(value=str(saved_settings["accent_color"]))
+        self.cpu_thread_profile = tk.StringVar(
+            value=str(saved_settings["cpu_thread_profile"])
         )
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
@@ -473,9 +698,33 @@ class SubtitleApp:
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
         try:
-            style.theme_use("vista")
+            # clam honours the foreground/background values below on macOS and
+            # Windows, unlike several native Tk themes that ignore them.
+            style.theme_use("clam")
         except tk.TclError:
             pass
+        is_dark = self.ui_theme.get() == "深色"
+        colors = (
+            {
+                "background": "#1f2329",
+                "surface": "#2b313a",
+                "input": "#343b46",
+                "foreground": "#f3f4f6",
+                "muted": "#b6c0ce",
+                "border": "#56606f",
+            }
+            if is_dark
+            else {
+                "background": "#f6f8fb",
+                "surface": "#ffffff",
+                "input": "#ffffff",
+                "foreground": "#1f2937",
+                "muted": "#5b6472",
+                "border": "#cbd5e1",
+            }
+        )
+        accent = ACCENT_COLORS.get(self.accent_color.get(), ACCENT_COLORS["蓝色"])
+        font_size = self.ui_font_size.get()
         # Use the platform's native CJK UI font. This avoids repeated fallback
         # resolution on macOS while preserving the Windows font configuration.
         ui_font = "PingFang SC" if IS_MACOS else "Microsoft YaHei UI"
@@ -490,20 +739,109 @@ class SubtitleApp:
         ):
             try:
                 tkfont.nametofont(font_name).configure(
-                    family=ui_font, size=14
+                    family=ui_font, size=font_size
                 )
             except tk.TclError:
                 pass
         try:
             tkfont.nametofont("TkFixedFont").configure(
-                family=fixed_font, size=14
+                family=fixed_font, size=font_size
             )
         except tk.TclError:
             pass
 
-        style.configure("Title.TLabel", font=(ui_font, 23, "bold"))
-        style.configure("Hint.TLabel", foreground="#5b6472")
-        style.configure("Drop.TLabel", anchor="center", padding=12, relief="solid")
+        self.root.configure(background=colors["background"])
+        style.configure(".", background=colors["background"], foreground=colors["foreground"])
+        style.configure("TFrame", background=colors["background"])
+        style.configure("TLabel", background=colors["background"], foreground=colors["foreground"])
+        style.configure("TLabelframe", background=colors["background"], bordercolor=colors["border"])
+        style.configure("TLabelframe.Label", background=colors["background"], foreground=colors["foreground"])
+        style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["foreground"])
+        style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["foreground"])
+        style.configure("TButton", padding=(9, 5))
+        style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(10, 5))
+        style.map(
+            "TButton",
+            background=[("active", accent)],
+            foreground=[("active", "#ffffff")],
+        )
+        style.map("Accent.TButton", background=[("active", accent)])
+        style.configure("Horizontal.TProgressbar", background=accent, troughcolor=colors["surface"])
+        style.configure("Title.TLabel", font=(ui_font, font_size + 9, "bold"))
+        style.configure("Hint.TLabel", background=colors["background"], foreground=colors["muted"])
+        style.configure(
+            "Drop.TLabel",
+            anchor="center",
+            padding=12,
+            relief="solid",
+            background=colors["surface"],
+            foreground=colors["foreground"],
+        )
+        if hasattr(self, "log"):
+            self.log.configure(
+                background=colors["input"], foreground=colors["foreground"],
+                insertbackground=colors["foreground"],
+            )
+
+    def _current_app_settings(self) -> dict[str, object]:
+        return {
+            "notification_enabled": self.notification_enabled.get(),
+            "notification_sound": self.notification_sound.get(),
+            "notification_sound_path": self.notification_sound_path.get(),
+            "ui_font_size": self.ui_font_size.get(),
+            "ui_theme": self.ui_theme.get(),
+            "accent_color": self.accent_color.get(),
+            "cpu_thread_profile": self.cpu_thread_profile.get(),
+        }
+
+    def _open_app_settings(self) -> None:
+        AppSettingsDialog(self)
+
+    def _apply_app_settings(self, settings: dict[str, object]) -> None:
+        self.notification_enabled.set(bool(settings["notification_enabled"]))
+        self.notification_sound.set(str(settings["notification_sound"]))
+        self.notification_sound_path.set(str(settings["notification_sound_path"]))
+        self.ui_font_size.set(int(settings["ui_font_size"]))
+        self.ui_theme.set(str(settings["ui_theme"]))
+        self.accent_color.set(str(settings["accent_color"]))
+        self.cpu_thread_profile.set(str(settings["cpu_thread_profile"]))
+        self._configure_style()
+        try:
+            save_app_settings(self._current_app_settings())
+        except OSError as exc:
+            self._append_log(f"无法保存应用设置：{exc}")
+        self.status.set("应用设置已保存。")
+
+    def _play_notification_sound(self, sound: str, sound_path: str) -> None:
+        """Play a short, non-blocking completion notification on the UI thread."""
+        custom_path = Path(sound_path).expanduser()
+        if sound == "自定义音频" and custom_path.is_file():
+            try:
+                if IS_MACOS:
+                    subprocess.Popen(
+                        ["afplay", str(custom_path)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    return
+                if sys.platform.startswith("win"):
+                    import winsound
+
+                    winsound.PlaySound(
+                        str(custom_path), winsound.SND_FILENAME | winsound.SND_ASYNC
+                    )
+                    return
+            except (OSError, RuntimeError):
+                pass
+        # Tk's bell is available on both supported platforms and is a safe
+        # fallback for an unavailable or unsupported custom audio file.
+        self.root.bell()
+
+    def _notify_task_complete(self) -> None:
+        if self.notification_enabled.get():
+            self._play_notification_sound(
+                self.notification_sound.get(), self.notification_sound_path.get()
+            )
 
     def _build(self) -> None:
         header = ttk.Frame(self.root)
@@ -514,6 +852,9 @@ class SubtitleApp:
             text="拖入文件，选择所需功能后即可处理。所有输出均会另存，不修改原文件。",
             style="Hint.TLabel",
         ).pack(side="left", padx=(18, 0), pady=(5, 0))
+        ttk.Button(header, text="应用设置…", command=self._open_app_settings).pack(
+            side="right"
+        )
 
         mode_frame = ttk.LabelFrame(self.root, text="选择功能", padding=(10, 7))
         mode_frame.pack(fill="x", pady=(0, 9))
@@ -781,7 +1122,9 @@ class SubtitleApp:
 
         button_row = ttk.Frame(self.root)
         button_row.pack(fill="x", pady=(0, 7))
-        self.start_button = ttk.Button(button_row, text="开始提取字幕", command=self._start)
+        self.start_button = ttk.Button(
+            button_row, text="开始提取字幕", command=self._start, style="Accent.TButton"
+        )
         self.start_button.pack(side="left")
         self.open_button = ttk.Button(
             button_row, text="打开保存文件夹", command=self._open_output_directory
@@ -1182,7 +1525,7 @@ class SubtitleApp:
                 self.output_preview.set("下载 MP4 模式：请选择视频保存文件夹。")
                 return
             self.output_preview.set(
-                "将以 yt-dlp 下载兼容 MP4 视频\n"
+                "将以 yt-dlp 下载兼容 MP4 视频，并保存同名 JPG 封面\n"
                 f"链接：{self.download_link.get().strip()}\n"
                 f"保存位置：{self.output_dir.get()}\n"
                 f"登录 Cookie：{self.download_cookie_browser.get()}"
@@ -1422,6 +1765,7 @@ class SubtitleApp:
                 cookie_browser,
                 output,
                 self.model_name.get(),
+                self.cpu_thread_profile.get(),
                 merge_gap,
                 duplicate_threshold,
                 self.filter_silent_b.get(),
@@ -1466,6 +1810,7 @@ class SubtitleApp:
         self._append_log(
             f"完成：已合并字幕 A+B（处理 {result.conflict_count} 组时间轴冲突）：{result.output_path}"
         )
+        self._notify_task_complete()
         messagebox.showinfo("字幕已合并", f"合并字幕已保存到：\n{result.output_path}")
 
     def _start_hallucination_cleanup(self, subtitle_path: str, output: str) -> None:
@@ -1494,6 +1839,7 @@ class SubtitleApp:
         self._append_log(
             f"完成：已删除 {result.removed_count} 条确认的可疑字幕：{result.output_path}"
         )
+        self._notify_task_complete()
         messagebox.showinfo(
             "清理完成",
             f"已删除 {result.removed_count} 条字幕。\n清理后字幕已保存到：\n{result.output_path}",
@@ -1513,6 +1859,7 @@ class SubtitleApp:
         cookie_browser: str | None,
         output: str,
         model_name: str,
+        cpu_thread_profile: str,
         merge_gap: float,
         duplicate_threshold: float,
         filter_silent_b: bool,
@@ -1538,6 +1885,7 @@ class SubtitleApp:
                         subtitle_a,
                         output,
                         model_name=model_name,
+                        cpu_thread_profile=cpu_thread_profile,
                         merge_gap=merge_gap,
                         filter_silent_b=filter_silent_b,
                         b_audio_min_rms=b_audio_min_rms,
@@ -1556,6 +1904,7 @@ class SubtitleApp:
                         video,
                         output,
                         model_name=model_name,
+                        cpu_thread_profile=cpu_thread_profile,
                         first_whisper_values=first_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
                         progress_callback=lambda stage, current, total: self.events.put(
@@ -1598,6 +1947,7 @@ class SubtitleApp:
                         video,
                         output,
                         model_name=model_name,
+                        cpu_thread_profile=cpu_thread_profile,
                         merge_gap=merge_gap,
                         duplicate_threshold=duplicate_threshold,
                         filter_silent_b=filter_silent_b,
@@ -1642,6 +1992,7 @@ class SubtitleApp:
                     self.status.set("字幕样式预览已生成。")
                     result, preview_window = payload
                     self._show_subtitle_preview(result, preview_window)
+                    self._notify_task_complete()
                 elif event_type == "preview_error":
                     self._append_log_batch(log_messages)
                     log_messages.clear()
@@ -1661,6 +2012,7 @@ class SubtitleApp:
                     self.status.set("处理完成。")
                     self._finish_progress()
                     self._append_log("全部完成。")
+                    self._notify_task_complete()
                     if mode == "second_only":
                         messagebox.showinfo(
                             "字幕 B 已生成", f"日语补全字幕 B 已保存到：\n{result.second_pass}"
@@ -1682,7 +2034,7 @@ class SubtitleApp:
                     elif mode == "download_mp4":
                         messagebox.showinfo(
                             "MP4 下载完成",
-                            f"视频已保存到：\n{result.output_dir}",
+                            f"视频与 JPG 封面已保存到：\n{result.output_dir}",
                         )
                     else:
                         messagebox.showinfo(

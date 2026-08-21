@@ -6,7 +6,7 @@ Double-clicking this file (or running it without arguments) opens the GUI.
 from __future__ import annotations
 import argparse
 from pathlib import Path
-from subtitle_pipeline import run_two_pass_transcription
+from subtitle_pipeline import CPU_THREAD_PROFILES, run_two_pass_transcription
 
 
 def main() -> None:
@@ -18,6 +18,12 @@ def main() -> None:
     parser.add_argument("--model", default="large-v2", help="Whisper 模型，默认 large-v2")
     parser.add_argument("--merge-gap", type=float, default=1.0, help="A 字幕间的合并间隔（秒）")
     parser.add_argument("--duplicate-threshold", type=float, default=0.5, help="合并去重阈值（秒）")
+    parser.add_argument(
+        "--cpu-thread-profile",
+        choices=CPU_THREAD_PROFILES,
+        default="performance",
+        help="CPU 模式：performance 使用更多线程；balanced 为 GUI 流畅预留核心",
+    )
     args = parser.parse_args()
 
     if not args.video:
@@ -31,6 +37,7 @@ def main() -> None:
         model_name=args.model,
         merge_gap=args.merge_gap,
         duplicate_threshold=args.duplicate_threshold,
+        cpu_thread_profile=args.cpu_thread_profile,
     )
     print(f"\n完成，合并字幕：{outputs.merged}")
 

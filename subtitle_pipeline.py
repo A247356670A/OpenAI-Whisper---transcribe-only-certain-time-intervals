@@ -275,18 +275,23 @@ def _import_dependencies():
     return librosa, torch, whisper
 
 
-def _reserve_cpu_for_gui(torch: Any) -> None:
-    """Avoid letting CPU-only Whisper starve Tk's event loop.
+CPU_THREAD_PROFILES = ("balanced", "performance")
+
+
+def _reserve_cpu_for_gui(torch: Any, profile: str = "balanced") -> int | None:
+    """Set a CPU thread budget that balances speed with GUI responsiveness.
 
     macOS schedules Tk, CoreText and window-server work alongside CPU-only
     Whisper kernels. Keeping a larger headroom there improves click and redraw
     responsiveness on Apple Silicon, while Windows retains its current setting.
     """
+    if profile not in CPU_THREAD_PROFILES:
+        raise ValueError(f"未知的 CPU 性能模式：{profile}")
     cpu_count = os.cpu_count() or 1
     if cpu_count < 2:
-        return
+        return None
     worker_threads = max(1, cpu_count - 1)
-    if sys.platform == "darwin":
+    if sys.platform == "darwin" and profile == "balanced":
         # Reserve enough cores for Tk and the desktop while keeping practical
         # transcription throughput on common Mac configurations.
         worker_threads = min(6, max(1, cpu_count - 2))
@@ -294,7 +299,8 @@ def _reserve_cpu_for_gui(torch: Any) -> None:
         torch.set_num_threads(worker_threads)
     except (AttributeError, RuntimeError):
         # Some Torch builds do not allow changing this after initialization.
-        pass
+        return None
+    return worker_threads
 
 
 def _probe_media_duration(path: Path) -> float | None:
@@ -476,6 +482,7 @@ def run_two_pass_transcription(
     b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
     b_speech_only: bool = False,
     b_vad_aggressiveness: int = 2,
+    cpu_thread_profile: str = "balanced",
     first_whisper_values: Mapping[str, Any] | None = None,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
@@ -512,7 +519,9 @@ def run_two_pass_transcription(
     librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
-        _reserve_cpu_for_gui(torch)
+        worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
+        if worker_threads:
+            _log(log_callback, f"CPU 线程：{worker_threads}（{'性能优先' if cpu_thread_profile == 'performance' else '平衡模式'}）。")
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
 
@@ -602,6 +611,7 @@ def run_first_pass_transcription(
     output_dir: str | Path | None = None,
     *,
     model_name: str = "large-v2",
+    cpu_thread_profile: str = "balanced",
     first_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -628,7 +638,9 @@ def run_first_pass_transcription(
     _librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
-        _reserve_cpu_for_gui(torch)
+        worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
+        if worker_threads:
+            _log(log_callback, f"CPU 线程：{worker_threads}（{'性能优先' if cpu_thread_profile == 'performance' else '平衡模式'}）。")
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
     first_options = build_whisper_options(
@@ -655,6 +667,7 @@ def run_second_pass_from_subtitle(
     b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
     b_speech_only: bool = False,
     b_vad_aggressiveness: int = 2,
+    cpu_thread_profile: str = "balanced",
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -691,7 +704,9 @@ def run_second_pass_from_subtitle(
     librosa, torch, whisper = _import_dependencies()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
-        _reserve_cpu_for_gui(torch)
+        worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
+        if worker_threads:
+            _log(log_callback, f"CPU 线程：{worker_threads}（{'性能优先' if cpu_thread_profile == 'performance' else '平衡模式'}）。")
     _log(log_callback, f"使用设备：{device.upper()}；正在加载 Whisper 模型 {model_name}…")
     model = whisper.load_model(model_name, device=device)
     second_options = build_whisper_options(
@@ -1240,6 +1255,9 @@ def download_video_as_mp4(
         "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a]/b[ext=mp4]",
         "--merge-output-format",
         "mp4",
+        "--write-thumbnail",
+        "--convert-thumbnails",
+        "jpg",
     ]
     if browser:
         command.extend(["--cookies-from-browser", browser])
@@ -1252,8 +1270,10 @@ def download_video_as_mp4(
         log_callback,
         '正在保存到目标文件夹：python -m yt_dlp -c -R 10 --retry-sleep 5 '
         '--http-chunk-size 1M -f "bv*[vcodec^=avc1][ext=mp4]+'
-        'ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 "(Link)"',
+        'ba[acodec^=mp4a]/b[ext=mp4]" --merge-output-format mp4 '
+        '--write-thumbnail --convert-thumbnails jpg "(Link)"',
     )
+    _log(log_callback, "将同时保存视频封面为同名 JPG 图片。")
     if browser:
         _log(
             log_callback,
@@ -1291,7 +1311,7 @@ def download_video_as_mp4(
     if process.wait() != 0:
         raise RuntimeError(_download_failure_message(output_lines))
     _progress(progress_callback, "download", 100, 100)
-    _log(log_callback, f"完成：视频已保存到 {destination}")
+    _log(log_callback, f"完成：视频和封面 JPG 已保存到 {destination}")
     return DownloadedVideoOutput(source_url=source_url, output_dir=destination)
 
 
