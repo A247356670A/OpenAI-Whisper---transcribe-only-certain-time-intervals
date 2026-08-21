@@ -20,24 +20,25 @@ from SrtMerge import merge_srt, write_srt
 from SrtToIntervals import extract_time_intervals
 from exclude_segments_by_intervals import exclude_segments_by_intervals
 from subtitle_pipeline import (
-    B_AUDIO_MIN_ACTIVE_SECONDS,
-    B_AUDIO_MIN_RMS,
-    B_AUDIO_SILENCE_TOP_DB,
+    B_SILERO_MIN_SPEECH_RATIO,
+    B_SILERO_MIN_SPEECH_SECONDS,
+    B_SILERO_THRESHOLD,
     LogCallback,
     ProgressCallback,
     _configure_whisper_device,
     _import_dependencies,
+    _load_audio_mono_16k,
     _log,
     _progress,
     _reserve_cpu_for_gui,
-    filter_silent_b_segments,
+    filter_b_segments_with_silero,
 )
 from transcribe import save_srt
 from whisper_options import build_whisper_options
 
 
 CancelCheck = Callable[[], bool]
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 2
 DEFAULT_A_CHUNK_SECONDS = 120.0
 DEFAULT_A_OVERLAP_SECONDS = 30.0
 
@@ -87,12 +88,10 @@ def _settings_identity(
     model_name: str,
     merge_gap: float,
     duplicate_threshold: float,
-    filter_silent_b: bool,
-    b_audio_min_rms: float,
-    b_audio_min_active_seconds: float,
-    b_audio_silence_top_db: int,
-    b_speech_only: bool,
-    b_vad_aggressiveness: int,
+    filter_b_speech: bool,
+    b_silero_threshold: float,
+    b_silero_min_speech_seconds: float,
+    b_silero_min_speech_ratio: float,
     cpu_thread_profile: str,
     gpu_acceleration: bool,
     first_whisper_values: Mapping[str, Any] | None,
@@ -104,12 +103,10 @@ def _settings_identity(
         "model_name": model_name,
         "merge_gap": merge_gap,
         "duplicate_threshold": duplicate_threshold,
-        "filter_silent_b": filter_silent_b,
-        "b_audio_min_rms": b_audio_min_rms,
-        "b_audio_min_active_seconds": b_audio_min_active_seconds,
-        "b_audio_silence_top_db": b_audio_silence_top_db,
-        "b_speech_only": b_speech_only,
-        "b_vad_aggressiveness": b_vad_aggressiveness,
+        "filter_b_speech": filter_b_speech,
+        "b_silero_threshold": b_silero_threshold,
+        "b_silero_min_speech_seconds": b_silero_min_speech_seconds,
+        "b_silero_min_speech_ratio": b_silero_min_speech_ratio,
         "cpu_thread_profile": cpu_thread_profile,
         "gpu_acceleration": gpu_acceleration,
         "first_whisper_values": dict(first_whisper_values or {}),
@@ -247,12 +244,10 @@ def run_resumable_two_pass_transcription(
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
     duplicate_threshold: float = 0.5,
-    filter_silent_b: bool = False,
-    b_audio_min_rms: float = B_AUDIO_MIN_RMS,
-    b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
-    b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
-    b_speech_only: bool = False,
-    b_vad_aggressiveness: int = 2,
+    filter_b_speech: bool = False,
+    b_silero_threshold: float = B_SILERO_THRESHOLD,
+    b_silero_min_speech_seconds: float = B_SILERO_MIN_SPEECH_SECONDS,
+    b_silero_min_speech_ratio: float = B_SILERO_MIN_SPEECH_RATIO,
     cpu_thread_profile: str = "balanced",
     gpu_acceleration: bool = False,
     first_whisper_values: Mapping[str, Any] | None = None,
@@ -282,12 +277,10 @@ def run_resumable_two_pass_transcription(
         model_name=model_name,
         merge_gap=merge_gap,
         duplicate_threshold=duplicate_threshold,
-        filter_silent_b=filter_silent_b,
-        b_audio_min_rms=b_audio_min_rms,
-        b_audio_min_active_seconds=b_audio_min_active_seconds,
-        b_audio_silence_top_db=b_audio_silence_top_db,
-        b_speech_only=b_speech_only,
-        b_vad_aggressiveness=b_vad_aggressiveness,
+        filter_b_speech=filter_b_speech,
+        b_silero_threshold=b_silero_threshold,
+        b_silero_min_speech_seconds=b_silero_min_speech_seconds,
+        b_silero_min_speech_ratio=b_silero_min_speech_ratio,
         cpu_thread_profile=cpu_thread_profile,
         gpu_acceleration=gpu_acceleration,
         first_whisper_values=first_whisper_values,
@@ -322,7 +315,7 @@ def run_resumable_two_pass_transcription(
         second_options["fp16"] = True
 
     _log(log_callback, "读取 16 kHz 单声道音频，准备可续传分片…")
-    audio_array, sample_rate = librosa.load(str(source), sr=16_000, mono=True)
+    audio_array, sample_rate = _load_audio_mono_16k(source, librosa, log_callback)
     duration = len(audio_array) / sample_rate
     total_a_chunks = math.ceil(duration / a_chunk_seconds) if duration else 0
     cancel_check = cancel_check or (lambda: False)
@@ -390,20 +383,19 @@ def run_resumable_two_pass_transcription(
     audio_segments, _remaining_intervals = exclude_segments_by_intervals(
         audio_array, full_interval, excluded_intervals, sample_rate
     )
-    if filter_silent_b and audio_segments:
-        audio_segments, skipped_intervals = filter_silent_b_segments(
+    if filter_b_speech and audio_segments:
+        audio_segments, skipped_intervals = filter_b_segments_with_silero(
             audio_segments,
             sample_rate,
-            librosa,
-            min_rms=b_audio_min_rms,
-            min_active_seconds=b_audio_min_active_seconds,
-            silence_top_db=b_audio_silence_top_db,
-            speech_only=b_speech_only,
-            vad_aggressiveness=b_vad_aggressiveness,
+            torch,
+            threshold=b_silero_threshold,
+            min_speech_seconds=b_silero_min_speech_seconds,
+            min_speech_ratio=b_silero_min_speech_ratio,
+            log_callback=log_callback,
         )
-        _log(log_callback, f"B 音频预筛跳过 {len(skipped_intervals)} 个片段。")
+        _log(log_callback, f"Silero B 人声预筛跳过 {len(skipped_intervals)} 个片段。")
     elif audio_segments:
-        _log(log_callback, "B 音频预筛关闭：保留全部反向剪裁片段。")
+        _log(log_callback, "Silero B 人声预筛关闭：保留全部反向剪裁片段。")
 
     b_subtitles = [dict(item) for item in state.get("b_subtitles", [])]
     completed_b = int(state.get("b_completed_segments", 0))

@@ -38,6 +38,9 @@ from subtitle_pipeline import (
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
+    B_SILERO_MIN_SPEECH_RATIO,
+    B_SILERO_MIN_SPEECH_SECONDS,
+    B_SILERO_THRESHOLD,
     SUBTITLE_COLOR_CHOICES,
     SUBTITLE_FONT_CHOICES,
 )
@@ -45,7 +48,11 @@ from resumable_transcription import (
     build_resumable_output_paths,
     run_resumable_two_pass_transcription,
 )
-from whisper_options import WHISPER_OPTION_SPECS, default_option_values
+from whisper_options import (
+    WHISPER_OPTION_HELP,
+    WHISPER_OPTION_SPECS,
+    default_option_values,
+)
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -62,11 +69,19 @@ VIDEO_FILE_TYPES = [
 IS_MACOS = sys.platform == "darwin"
 
 APP_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_settings.json"
+APP_SETTINGS_VERSION = 3
+BUILTIN_NOTIFICATION_PATH = (
+    Path(__file__).resolve().parent / "assets" / "completion_notification.wav"
+)
+NOTIFICATION_SOUND_CHOICES = ("内置提示音", "系统提示音", "自定义音频")
+MIN_UI_FONT_SIZE = 8
+MAX_UI_FONT_SIZE = 18
 DEFAULT_APP_SETTINGS = {
+    "settings_version": APP_SETTINGS_VERSION,
     "notification_enabled": True,
-    "notification_sound": "系统提示音",
+    "notification_sound": "内置提示音",
     "notification_sound_path": "",
-    "ui_font_size": 14,
+    "ui_font_size": 12,
     "ui_theme": "浅色",
     "accent_color": "蓝色",
     "cpu_thread_profile": "balanced",
@@ -87,14 +102,6 @@ CPU_THREAD_PROFILE_LABELS_REVERSED = {
     value: label for label, value in CPU_THREAD_PROFILE_LABELS.items()
 }
 
-B_AUDIO_FILTER_PRESETS = {
-    "仅跳过完全静音（推荐）": ("0.0001", "0.05", "45"),
-    "平衡": ("0.001", "0.25", "35"),
-    "强过滤": ("0.003", "0.50", "25"),
-    "自定义": None,
-}
-VAD_AGGRESSIVENESS = {"宽松": 1, "平衡": 2, "严格": 3}
-
 DOWNLOAD_COOKIE_BROWSER_LABELS = {
     "不使用浏览器 Cookie": None,
     "Chrome（已登录 YouTube）": "chrome",
@@ -103,6 +110,200 @@ DOWNLOAD_COOKIE_BROWSER_LABELS = {
     "Brave（已登录 YouTube）": "brave",
     "Safari（已登录 YouTube）": "safari",
 }
+
+
+MAIN_PARAMETER_HELP = {
+    "download_cookie": """作用：让 yt-dlp 读取所选浏览器中已经登录的 YouTube Cookie，用于通过年龄限制、地区限制或“确认您不是机器人”等验证。
+
+怎么选：普通公开视频先选“不使用浏览器 Cookie”。只有下载日志要求登录时，才选择当前电脑上已经登录 YouTube 的 Chrome、Edge、Firefox 等浏览器。
+
+例子：你平时在 Edge 中能够正常观看目标视频，但 GUI 下载提示 Sign in to confirm you're not a bot，此时选择“Edge（已登录 YouTube）”后重试。
+
+注意：运行下载时最好关闭对应浏览器，避免 Cookie 数据库被占用。程序不会把 Cookie 写进项目文件，但浏览器登录信息仍属于敏感数据，不要把日志或浏览器配置发给他人。""",
+    "model": """作用：选择 Whisper 模型大小。模型越大通常越能识别日语专有名词、口语和噪声中的对白，但速度更慢、显存或内存占用更高。
+
+大致选择：tiny/base 适合快速试运行；small/medium 适合速度和质量折中；large-v2/large-v3 适合最终字幕。项目默认 large-v2，以保持原流程结果。
+
+例子：先用 small 测试 45～55 分钟参数是否能正常运行，确定设置后再用 large-v2 跑完整视频。
+
+注意：更换模型会改变识别文字，断点续传时必须继续使用创建断点时的同一模型。GPU 显存不足时可降低模型或关闭 GPU 模式。""",
+    "gpu": """作用：让 Whisper 使用 NVIDIA CUDA GPU 推理，通常比 CPU 快很多，并自动在 GPU 上使用 FP16。
+
+启用条件：电脑需要 NVIDIA 显卡、可用驱动，以及与 CUDA 匹配的 PyTorch。可用 python -c \"import torch; print(torch.cuda.is_available())\" 检查，结果应为 True。
+
+例子：RTX 显卡且 torch.cuda.is_available() 为 True 时勾选；只有 Intel/AMD 集显、Mac 或安装的是 +cpu PyTorch 时不要勾选。
+
+注意：勾选本身不会安装 CUDA。若显存不足，可换较小模型或关闭此项回到 CPU。""",
+    "merge_gap": """作用：读取字幕 A 时间轴时，把间隔很近的 A 字幕合并为一个已覆盖区间。合并后的区间会从音频中反向排除，剩余部分才生成字幕 B。
+
+默认：1.0 秒。数值越大，A 区间之间越多空隙会被视为已经覆盖，因此 B 候选片段会更少；数值越小，B 会检查更多短空隙。
+
+例子：A 第一条结束于 10.0 秒，下一条开始于 10.7 秒。合并间隔 1.0 时两段会连在一起，0.5 时中间 0.7 秒可能成为 B 候选。
+
+调节建议：怀疑 B 片段太少时试 0～0.5；B 中充满句间短停顿幻觉时可试 1～1.5。""",
+    "duplicate_threshold": """作用：最终合并 A 与 B 时，用时间接近程度判断两条字幕是否可能重复。它只影响合并结果，不决定 B 音频如何裁切。
+
+默认：0.5 秒。数值越大，时间接近的 A/B 越容易被判为重复并只保留一条；数值越小，越倾向于两条都保留。
+
+例子：A 在 12.0 秒、B 在 12.3 秒出现同样文字。阈值 0.5 时通常会去重；阈值 0.2 时可能都保留。
+
+注意：若字幕内容不同但时间重叠，自动合并仍可能保留；需要精确选择时可使用“合并字幕 A+B”人工处理冲突。""",
+    "silero_enabled": """作用：在把反向剪裁出的 B 候选片段交给 Whisper 前，先用 Silero VAD 判断其中是否含有人声。未达到条件的片段会跳过，以减少静音、纯环境声导致的幻觉。
+
+默认关闭：关闭时完整保留所有 B 候选片段，与最初的 B 生成逻辑一致。开启后，下方三个 Silero 参数才会影响结果。
+
+例子：一个 8 秒候选片段只有游戏环境音乐，没有任何说话声；开启后可能被跳过，关闭时仍会交给 Whisper。
+
+注意：Silero 只能判断“像人声”，不能区分主播、游戏角色或背景电视。第一次使用需要安装 requirements.txt 中的 silero-vad。""",
+    "silero_threshold": """作用：Silero 判断每个短音频窗口是人声的概率门槛，范围 0～1。越低越宽松，越不容易漏掉轻声；越高越严格，过滤更多背景噪声。
+
+默认：0.4，偏向保留。安静对白或强 BGM 下的人声被漏掉时可试 0.25～0.35；纯音乐经常被误判成人声时可试 0.5～0.65。
+
+例子：某个窗口的人声概率为 0.36。阈值 0.4 时不算人声，阈值 0.3 时会算作人声。
+
+建议：每次只改变 0.05～0.1，并根据日志中每段的人声时长和占比横向比较。""",
+    "silero_min_seconds": """作用：一个完整 B 候选片段中，Silero 累计检测到的人声至少要达到多少秒，片段才会保留。
+
+默认：0.10 秒，主要排除完全没有人声的片段。调高会过滤只有极短声音的片段，但也可能漏掉“嗯”“啊”等很短的真实发言。
+
+例子：10 秒候选片段累计检测到 0.08 秒人声。最少人声设 0.10 时跳过，设 0.05 时保留。
+
+推荐：希望少漏对白时用 0.05～0.15；需要更强过滤时再逐步试 0.3～0.5。""",
+    "silero_min_ratio": """作用：要求检测到的人声时长至少占整个 B 候选片段的百分比。它与“最短累计人声”同时满足时才保留。
+
+默认：0%，表示不限制占比，只要求达到最短累计人声。提高占比会更容易跳过“很长的片段中只有一句短对白”的情况。
+
+例子：20 秒片段包含 1 秒人声，占比为 5%。设 0% 或 5% 时可保留；设 10% 时会跳过。
+
+建议：为了避免漏字幕，通常保持 0%；只有确认大量长片段里只有偶发误判时，再从 1%～3% 小幅增加。""",
+    "burn_font": """作用：选择烧录到视频画面中的字幕字体。需要该字体已经安装在运行 FFmpeg 的电脑上。
+
+默认：微软雅黑。中文和日文混合字幕应选择同时覆盖两种文字的字体，例如微软雅黑、思源黑体或 Noto Sans CJK。
+
+例子：选择微软雅黑后预览正常，但换到另一台没有该字体的电脑时 FFmpeg 可能回退到其他字体或显示方框；此时应安装字体或改选当地存在的字体。
+
+注意：请先使用“预览字幕样式”检查日文假名、汉字和标点。""",
+    "burn_color": """作用：设置字幕文字主体颜色。描边颜色固定为黑色，以便在明暗变化的视频背景上保持可读性。
+
+默认：白色。白色 + 黑色描边适合大多数直播画面；黄色可用于需要与视频原字幕区分的场景。
+
+例子：画面底部常有白色 UI 时，可以尝试黄色文字，或保留白色并增加描边。
+
+注意：颜色只影响新烧录的字幕，不会修改 SRT 文件内容。""",
+    "burn_size": """作用：设置 FFmpeg/ASS 字幕字号。实际视觉大小还会受到视频分辨率、字体本身和播放器缩放影响。
+
+默认：16。1080p 视频可从 16 开始；4K 视频通常需要更大；720p 视频可能需要稍小。
+
+例子：1080p 预览中文字太小，可依次试 18、20；一行字幕经常超出画面则减小到 14～15。
+
+注意：必须输入正整数，并以预览画面为准。""",
+    "burn_outline": """作用：设置字幕四周黑色描边的粗细。描边能让浅色文字在复杂背景上保持清晰。
+
+默认：0.8。数值越大边缘越粗、可读性越强，但过大会让小字号显得拥挤。
+
+例子：白色字幕在明亮天空中不清楚，可从 0.8 增加到 1.2；画面风格要求轻薄时可减到 0.5。
+
+注意：允许小数，必须大于或等于 0；设为 0 表示无描边。""",
+    "burn_margin": """作用：设置字幕基线区域距离视频底部的垂直边距，单位是 ASS 样式使用的像素尺度。
+
+默认：10，位置接近底部。数值越大，字幕整体越向上移动。
+
+例子：视频底部有游戏 UI 或主播名牌遮挡字幕，可把 10 改成 40、60，再刷新预览；希望更贴近底边则减小。
+
+注意：不同分辨率视觉距离会不同，应使用当前目标视频生成预览。""",
+}
+
+
+APP_PARAMETER_HELP = {
+    "notification_enabled": """作用：任务成功完成后播放提示音，适合长视频在后台运行时提醒你查看结果。
+
+例子：处理两小时直播时开启；测试几秒短片或不希望打扰时关闭。
+
+注意：只有成功完成时提示；错误和主动取消仍会通过弹窗及日志说明。""",
+    "notification_sound": """作用：选择软件内置的“敲敲来电”提示音、系统提示音或你指定的音频文件。
+
+例子：默认“内置提示音”会播放随软件提供的“敲敲来电”；选择“系统提示音”会使用系统短提示；选择“自定义音频”后，再在下一行选择 WAV 等文件。
+
+注意：Windows 自定义播放优先支持 WAV；文件无法播放时会回退到系统提示音。""",
+    "notification_file": """作用：指定任务完成时播放的本地音频文件路径，仅在提示音选择“自定义音频”时使用。
+
+例子：选择 C:\\Sounds\\complete.wav，然后点击“试听”确认。
+
+注意：移动或删除该文件后路径会失效，程序会安全地回退到系统提示音。""",
+    "ui_font_size": """作用：调整整个 GUI 的基础字体大小，允许 8～18 的整数。按钮、标签、输入框和日志会一起变化。
+
+默认：12。1600×900 且系统缩放 100%～150% 时通常合适；高分辨率屏幕看不清可试 14～16。
+
+例子：输入 14 并应用，所有界面文字会放大两号；如果控件过于拥挤可恢复 12。
+
+注意：字体太大时，小屏幕需要滚动或放大窗口。""",
+    "theme": """作用：切换浅色或深色界面的背景、输入框和文字配色，不影响输出字幕或视频。
+
+例子：夜间长时间监看日志可选深色；在明亮环境下可选浅色。
+
+注意：应用后立即生效并保存到本机设置文件。""",
+    "accent": """作用：选择开始按钮、进度条和控件悬停时使用的强调色。
+
+例子：选择绿色后，任务进度条和主要操作按钮会使用绿色。
+
+注意：只改变 GUI 外观，不改变烧录字幕颜色。""",
+    "cpu_profile": """作用：控制 CPU 转写时 Whisper 可使用的线程倾向。平衡模式会为 GUI 和系统保留更多响应空间；性能优先会尽量使用更多 CPU。
+
+推荐：需要边处理边操作电脑时选“平衡（界面优先）”；专门用于转写且希望更快时选“性能优先”。
+
+例子：CPU 满载时按钮响应迟缓，可切回平衡模式；使用 CUDA GPU 时此设置影响较小。
+
+注意：线程更多不一定线性加速，散热不足的笔记本可能因降频反而收益有限。""",
+}
+
+
+def show_parameter_help(parent: tk.Misc, title: str, body: str) -> None:
+    """Open a readable, selectable, scrollable explanation for one parameter."""
+    owner = parent.winfo_toplevel()
+    window = tk.Toplevel(owner)
+    window.title(f"参数说明 · {title}")
+    fit_window_to_screen(window, 780, 620, 620, 420)
+    window.transient(owner)
+    window.configure(padx=16, pady=14)
+
+    ttk.Label(window, text=title, style="Title.TLabel").pack(anchor="w", pady=(0, 10))
+    container = ttk.Frame(window)
+    container.pack(fill="both", expand=True)
+    text_widget = tk.Text(
+        container,
+        wrap="word",
+        padx=14,
+        pady=12,
+        relief="solid",
+        borderwidth=1,
+    )
+    scrollbar = ttk.Scrollbar(container, orient="vertical", command=text_widget.yview)
+    text_widget.configure(yscrollcommand=scrollbar.set)
+    text_widget.insert("1.0", body.strip())
+    text_widget.configure(state="disabled")
+    text_widget.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+    ttk.Button(window, text="关闭", command=window.destroy).pack(anchor="e", pady=(12, 0))
+    window.bind("<Escape>", lambda _event: window.destroy())
+
+
+def help_button(parent: tk.Misc, title: str, body: str) -> ttk.Button:
+    """Create the consistent question-mark button used beside a parameter."""
+    return ttk.Button(
+        parent,
+        text="?",
+        width=2,
+        style="Help.TButton",
+        command=lambda: show_parameter_help(parent, title, body),
+    )
+
+
+def parameter_label(parent: tk.Misc, text: str, title: str, body: str) -> ttk.Frame:
+    """Place a label and its clickable question mark in one geometry cell."""
+    frame = ttk.Frame(parent)
+    ttk.Label(frame, text=text).pack(side="left")
+    help_button(frame, title, body).pack(side="left", padx=(4, 0))
+    return frame
 
 
 def load_app_settings(path: Path = APP_SETTINGS_PATH) -> dict[str, object]:
@@ -114,6 +315,7 @@ def load_app_settings(path: Path = APP_SETTINGS_PATH) -> dict[str, object]:
         return settings
     if not isinstance(loaded, dict):
         return settings
+    loaded_version = loaded.get("settings_version", 1)
     for key, default in DEFAULT_APP_SETTINGS.items():
         value = loaded.get(key, default)
         if isinstance(value, type(default)):
@@ -124,7 +326,24 @@ def load_app_settings(path: Path = APP_SETTINGS_PATH) -> dict[str, object]:
         settings["accent_color"] = DEFAULT_APP_SETTINGS["accent_color"]
     if settings["cpu_thread_profile"] not in CPU_THREAD_PROFILE_LABELS_REVERSED:
         settings["cpu_thread_profile"] = DEFAULT_APP_SETTINGS["cpu_thread_profile"]
-    if not 10 <= int(settings["ui_font_size"]) <= 24:
+    # Apply the requested two-point reduction exactly once to settings saved
+    # by earlier versions.  The version marker prevents repeated shrinking.
+    if isinstance(loaded_version, int) and loaded_version < 2:
+        legacy_font_size = loaded.get("ui_font_size")
+        if isinstance(legacy_font_size, int) and 10 <= legacy_font_size <= 24:
+            settings["ui_font_size"] = max(
+                MIN_UI_FONT_SIZE,
+                min(MAX_UI_FONT_SIZE, legacy_font_size - 2),
+            )
+        else:
+            settings["ui_font_size"] = DEFAULT_APP_SETTINGS["ui_font_size"]
+    if isinstance(loaded_version, int) and loaded_version < 3:
+        if settings["notification_sound"] == "系统提示音":
+            settings["notification_sound"] = "内置提示音"
+    if settings["notification_sound"] not in NOTIFICATION_SOUND_CHOICES:
+        settings["notification_sound"] = DEFAULT_APP_SETTINGS["notification_sound"]
+    settings["settings_version"] = APP_SETTINGS_VERSION
+    if not MIN_UI_FONT_SIZE <= int(settings["ui_font_size"]) <= MAX_UI_FONT_SIZE:
         settings["ui_font_size"] = DEFAULT_APP_SETTINGS["ui_font_size"]
     return settings
 
@@ -134,6 +353,26 @@ def save_app_settings(settings: dict[str, object], path: Path = APP_SETTINGS_PAT
     payload = {key: settings.get(key, default) for key, default in DEFAULT_APP_SETTINGS.items()}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def fit_window_to_screen(
+    window: tk.Misc,
+    desired_width: int,
+    desired_height: int,
+    minimum_width: int,
+    minimum_height: int,
+) -> None:
+    """Keep windows inside the display while preserving useful minimum sizes."""
+    screen_width = max(480, int(window.winfo_screenwidth()))
+    screen_height = max(480, int(window.winfo_screenheight()))
+    available_width = max(460, screen_width - 60)
+    available_height = max(440, screen_height - 100)
+    width = min(desired_width, available_width)
+    height = min(desired_height, available_height)
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 3)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+    window.minsize(min(minimum_width, width), min(minimum_height, height))
 
 
 def enable_high_dpi_awareness() -> None:
@@ -182,8 +421,7 @@ class WhisperOptionsDialog:
     ):
         self.window = tk.Toplevel(parent)
         self.window.title("Whisper 高级参数（第一轮 A / 第二轮 B）")
-        self.window.geometry("1420x920")
-        self.window.minsize(1060, 700)
+        fit_window_to_screen(self.window, 1420, 920, 900, 620)
         self.window.transient(parent)
         self.window.configure(padx=16, pady=14)
 
@@ -191,7 +429,7 @@ class WhisperOptionsDialog:
             self.window,
             text="两轮参数彼此独立。每项说明均显示在右侧；恢复默认只影响当前标签页。",
             style="Hint.TLabel",
-            wraplength=1320,
+            wraplength=820,
         ).pack(anchor="w", pady=(0, 10))
         notebook = ttk.Notebook(self.window)
         notebook.pack(fill="both", expand=True)
@@ -226,8 +464,21 @@ class WhisperOptionsDialog:
         ttk.Label(content, text="说明", style="Hint.TLabel").grid(row=0, column=2, sticky="w")
 
         for row, spec in enumerate(WHISPER_OPTION_SPECS, start=1):
-            ttk.Label(content, text=f"{spec.label}\n{spec.key}", justify="left").grid(
-                row=row, column=0, sticky="nw", padx=(0, 10), pady=7
+            name_cell = ttk.Frame(content)
+            name_cell.grid(row=row, column=0, sticky="nw", padx=(0, 10), pady=7)
+            ttk.Label(name_cell, text=spec.label).grid(row=0, column=0, sticky="w")
+            help_button(
+                name_cell,
+                f"{spec.label}（{spec.key}）",
+                WHISPER_OPTION_HELP[spec.key],
+            ).grid(row=0, column=1, sticky="w", padx=(5, 0))
+            ttk.Label(
+                name_cell,
+                text=spec.key,
+                style="Hint.TLabel",
+                wraplength=175,
+            ).grid(
+                row=1, column=0, columnspan=2, sticky="w"
             )
             if spec.choices:
                 editor = ttk.Combobox(
@@ -235,17 +486,17 @@ class WhisperOptionsDialog:
                     textvariable=values[spec.key],
                     values=spec.choices,
                     state="readonly",
-                    width=26,
+                    width=20,
                 )
             else:
-                editor = ttk.Entry(content, textvariable=values[spec.key], width=34)
+                editor = ttk.Entry(content, textvariable=values[spec.key], width=22)
             editor.grid(row=row, column=1, sticky="ew", padx=(0, 14), pady=7)
             ttk.Label(
                 content,
                 text=spec.description,
                 style="Hint.TLabel",
                 justify="left",
-                wraplength=700,
+                wraplength=400,
             ).grid(row=row, column=2, sticky="nw", pady=7)
 
         reset = ttk.Button(
@@ -277,8 +528,7 @@ class AppSettingsDialog:
         self.app = app
         self.window = tk.Toplevel(app.root)
         self.window.title("应用设置")
-        self.window.geometry("700x500")
-        self.window.minsize(600, 440)
+        fit_window_to_screen(self.window, 920, 540, 740, 460)
         self.window.transient(app.root)
         self.window.configure(padx=18, pady=15)
 
@@ -294,23 +544,40 @@ class AppSettingsDialog:
 
         notification = ttk.LabelFrame(self.window, text="任务完成提示", padding=10)
         notification.pack(fill="x")
+        notification_switch = ttk.Frame(notification)
+        notification_switch.grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Checkbutton(
-            notification,
+            notification_switch,
             text="任务成功完成后播放提示音",
             variable=self.notification_enabled,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(notification, text="提示音").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ).pack(side="left")
+        help_button(
+            notification_switch,
+            "完成提示音开关",
+            APP_PARAMETER_HELP["notification_enabled"],
+        ).pack(side="left", padx=(5, 0))
+        parameter_label(
+            notification,
+            "提示音",
+            "提示音类型",
+            APP_PARAMETER_HELP["notification_sound"],
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Combobox(
             notification,
             textvariable=self.notification_sound,
-            values=("系统提示音", "自定义音频"),
+            values=NOTIFICATION_SOUND_CHOICES,
             state="readonly",
             width=16,
         ).grid(row=1, column=1, sticky="w", padx=(8, 12), pady=(10, 0))
         ttk.Button(notification, text="试听", command=self._preview_sound).grid(
             row=1, column=2, sticky="w", pady=(10, 0)
         )
-        ttk.Label(notification, text="自定义文件").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        parameter_label(
+            notification,
+            "自定义文件",
+            "自定义提示音文件",
+            APP_PARAMETER_HELP["notification_file"],
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(notification, textvariable=self.notification_sound_path).grid(
             row=2, column=1, sticky="ew", padx=(8, 8), pady=(8, 0)
         )
@@ -325,15 +592,22 @@ class AppSettingsDialog:
 
         appearance = ttk.LabelFrame(self.window, text="界面外观", padding=10)
         appearance.pack(fill="x", pady=(12, 0))
-        ttk.Label(appearance, text="界面字体大小").grid(row=0, column=0, sticky="w")
+        parameter_label(
+            appearance,
+            "界面字体大小",
+            "界面字体大小",
+            APP_PARAMETER_HELP["ui_font_size"],
+        ).grid(row=0, column=0, sticky="w")
         ttk.Spinbox(
             appearance,
-            from_=10,
-            to=24,
+            from_=MIN_UI_FONT_SIZE,
+            to=MAX_UI_FONT_SIZE,
             textvariable=self.ui_font_size,
             width=6,
         ).grid(row=0, column=1, sticky="w", padx=(8, 26))
-        ttk.Label(appearance, text="主题").grid(row=0, column=2, sticky="w")
+        parameter_label(
+            appearance, "主题", "界面主题", APP_PARAMETER_HELP["theme"]
+        ).grid(row=0, column=2, sticky="w")
         ttk.Combobox(
             appearance,
             textvariable=self.ui_theme,
@@ -341,29 +615,35 @@ class AppSettingsDialog:
             state="readonly",
             width=8,
         ).grid(row=0, column=3, sticky="w", padx=(8, 26))
-        ttk.Label(appearance, text="主题色").grid(row=0, column=4, sticky="w")
+        parameter_label(
+            appearance, "主题色", "界面主题色", APP_PARAMETER_HELP["accent"]
+        ).grid(row=1, column=0, sticky="w", pady=(10, 0))
         ttk.Combobox(
             appearance,
             textvariable=self.accent_color,
             values=ACCENT_COLOR_CHOICES,
             state="readonly",
             width=8,
-        ).grid(row=0, column=5, sticky="w", padx=(8, 0))
-        ttk.Label(appearance, text="转写性能").grid(
-            row=1, column=0, sticky="w", pady=(12, 0)
-        )
+        ).grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
+        parameter_label(
+            appearance,
+            "转写性能",
+            "CPU 转写性能",
+            APP_PARAMETER_HELP["cpu_profile"],
+        ).grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Combobox(
             appearance,
             textvariable=self.cpu_thread_profile,
             values=tuple(CPU_THREAD_PROFILE_LABELS),
             state="readonly",
             width=18,
-        ).grid(row=1, column=1, columnspan=2, sticky="w", padx=(8, 0), pady=(12, 0))
+        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(10, 0))
         ttk.Label(
             appearance,
             text="性能优先会在 macOS 上使用更多 CPU 线程；处理时界面可能略有迟滞。",
             style="Hint.TLabel",
-        ).grid(row=1, column=3, columnspan=3, sticky="w", padx=(16, 0), pady=(12, 0))
+            wraplength=420,
+        ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(16, 0), pady=(10, 0))
 
         buttons = ttk.Frame(self.window)
         buttons.pack(fill="x", pady=(18, 0))
@@ -399,10 +679,14 @@ class AppSettingsDialog:
     def _apply(self) -> None:
         try:
             font_size = int(self.ui_font_size.get())
-            if not 10 <= font_size <= 24:
+            if not MIN_UI_FONT_SIZE <= font_size <= MAX_UI_FONT_SIZE:
                 raise ValueError
         except ValueError:
-            messagebox.showwarning("字体大小不正确", "界面字体大小请输入 10 到 24 之间的整数。", parent=self.window)
+            messagebox.showwarning(
+                "字体大小不正确",
+                f"界面字体大小请输入 {MIN_UI_FONT_SIZE} 到 {MAX_UI_FONT_SIZE} 之间的整数。",
+                parent=self.window,
+            )
             return
         self.app._apply_app_settings(
             {
@@ -429,8 +713,7 @@ class SubtitleConflictDialog:
         self.editors: list[tuple[tk.StringVar, tk.Text, tk.Text]] = []
         self.window = tk.Toplevel(parent)
         self.window.title("处理字幕时间轴冲突")
-        self.window.geometry("1480x840")
-        self.window.minsize(1060, 650)
+        fit_window_to_screen(self.window, 1480, 840, 900, 600)
         self.window.transient(parent)
         self.window.configure(padx=14, pady=12)
 
@@ -441,7 +724,7 @@ class SubtitleConflictDialog:
                 "两侧内容均可直接编辑（请保留标准 SRT 时间轴格式）。"
             ),
             style="Hint.TLabel",
-            wraplength=1400,
+            wraplength=820,
         ).pack(anchor="w", pady=(0, 9))
 
         holder = ttk.Frame(self.window)
@@ -495,8 +778,8 @@ class SubtitleConflictDialog:
         ).pack(anchor="w")
 
         height = max(4, min(12, max(len(conflict.a_entries), len(conflict.b_entries)) * 4))
-        a_text = tk.Text(card, height=height, wrap="word")
-        b_text = tk.Text(card, height=height, wrap="word")
+        a_text = tk.Text(card, height=height, width=1, wrap="word")
+        b_text = tk.Text(card, height=height, width=1, wrap="word")
         a_text.insert("1.0", format_srt_entries(conflict.a_entries))
         b_text.insert("1.0", format_srt_entries(conflict.b_entries))
         a_text.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(5, 0))
@@ -530,8 +813,7 @@ class HallucinationReviewDialog:
         self.delete_flags: list[tuple[int, tk.BooleanVar]] = []
         self.window = tk.Toplevel(parent)
         self.window.title("审核可能的幻觉字幕")
-        self.window.geometry("1320x820")
-        self.window.minsize(960, 620)
+        fit_window_to_screen(self.window, 1320, 820, 860, 580)
         self.window.transient(parent)
         self.window.configure(padx=14, pady=12)
 
@@ -542,7 +824,7 @@ class HallucinationReviewDialog:
                 "请勾选确认删除。每项均显示时间、文本及前后字幕上下文。"
             ),
             style="Hint.TLabel",
-            wraplength=1240,
+            wraplength=780,
         ).pack(anchor="w", pady=(0, 9))
 
         holder = ttk.Frame(self.window)
@@ -590,8 +872,9 @@ class HallucinationReviewDialog:
                 f"标记原因：{'、'.join(candidate.reasons)}"
             ),
             style="Hint.TLabel",
+            wraplength=760,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(card, text=f"字幕：{text}", wraplength=1180).grid(
+        ttk.Label(card, text=f"字幕：{text}", wraplength=760).grid(
             row=2, column=0, sticky="w", pady=(4, 0)
         )
         previous = self._format_context("前一条", candidate.previous_entry)
@@ -601,7 +884,7 @@ class HallucinationReviewDialog:
             text=f"上下文\n{previous}\n{following}",
             style="Hint.TLabel",
             justify="left",
-            wraplength=1180,
+            wraplength=760,
         ).grid(row=3, column=0, sticky="w", pady=(6, 0))
 
     @staticmethod
@@ -628,8 +911,7 @@ class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("日语字幕提取器 · Whisper 双重识别")
-        self.root.geometry("1600x900")
-        self.root.minsize(1100, 760)
+        fit_window_to_screen(self.root, 1600, 900, 980, 700)
         self.root.configure(padx=18, pady=14)
 
         saved_settings = load_app_settings()
@@ -671,15 +953,12 @@ class SubtitleApp:
         self.gpu_acceleration = tk.BooleanVar(value=False)
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
-        # Opt-in only: unchecked means the exact pre-filter B workflow, where
-        # every gap left after reverse-cutting against subtitle A is retained.
-        self.filter_silent_b = tk.BooleanVar(value=False)
-        self.b_audio_preset = tk.StringVar(value="仅跳过完全静音（推荐）")
-        self.b_audio_min_rms = tk.StringVar(value="0.0001")
-        self.b_audio_min_active_seconds = tk.StringVar(value="0.05")
-        self.b_audio_silence_top_db = tk.StringVar(value="45")
-        self.b_speech_only = tk.BooleanVar(value=False)
-        self.b_vad_strength = tk.StringVar(value="平衡")
+        # Opt-in only: unchecked retains every reverse-cut B gap.  Silero
+        # replaces the former RMS and WebRTC filters with one speech model.
+        self.filter_b_speech = tk.BooleanVar(value=False)
+        self.b_silero_threshold = tk.StringVar(value="0.4")
+        self.b_silero_min_speech_seconds = tk.StringVar(value="0.10")
+        self.b_silero_min_speech_ratio_percent = tk.StringVar(value="0")
         self.burn_font_name = tk.StringVar(value="微软雅黑")
         self.burn_font_color = tk.StringVar(value="白色")
         self.burn_font_size = tk.StringVar(value="16")
@@ -770,6 +1049,7 @@ class SubtitleApp:
         style.configure("TEntry", fieldbackground=colors["input"], foreground=colors["foreground"])
         style.configure("TCombobox", fieldbackground=colors["input"], foreground=colors["foreground"])
         style.configure("TButton", padding=(9, 5))
+        style.configure("Help.TButton", padding=(3, 1), font=(ui_font, font_size, "bold"))
         style.configure("Accent.TButton", background=accent, foreground="#ffffff", padding=(10, 5))
         style.map(
             "TButton",
@@ -778,7 +1058,7 @@ class SubtitleApp:
         )
         style.map("Accent.TButton", background=[("active", accent)])
         style.configure("Horizontal.TProgressbar", background=accent, troughcolor=colors["surface"])
-        style.configure("Title.TLabel", font=(ui_font, font_size + 9, "bold"))
+        style.configure("Title.TLabel", font=(ui_font, min(font_size + 9, 22), "bold"))
         style.configure("Hint.TLabel", background=colors["background"], foreground=colors["muted"])
         style.configure(
             "Drop.TLabel",
@@ -796,6 +1076,7 @@ class SubtitleApp:
 
     def _current_app_settings(self) -> dict[str, object]:
         return {
+            "settings_version": APP_SETTINGS_VERSION,
             "notification_enabled": self.notification_enabled.get(),
             "notification_sound": self.notification_sound.get(),
             "notification_sound_path": self.notification_sound_path.get(),
@@ -826,11 +1107,16 @@ class SubtitleApp:
     def _play_notification_sound(self, sound: str, sound_path: str) -> None:
         """Play a short, non-blocking completion notification on the UI thread."""
         custom_path = Path(sound_path).expanduser()
-        if sound == "自定义音频" and custom_path.is_file():
+        playback_path: Path | None = None
+        if sound == "内置提示音" and BUILTIN_NOTIFICATION_PATH.is_file():
+            playback_path = BUILTIN_NOTIFICATION_PATH
+        elif sound == "自定义音频" and custom_path.is_file():
+            playback_path = custom_path
+        if playback_path is not None:
             try:
                 if IS_MACOS:
                     subprocess.Popen(
-                        ["afplay", str(custom_path)],
+                        ["afplay", str(playback_path)],
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
                     )
@@ -839,7 +1125,7 @@ class SubtitleApp:
                     import winsound
 
                     winsound.PlaySound(
-                        str(custom_path), winsound.SND_FILENAME | winsound.SND_ASYNC
+                        str(playback_path), winsound.SND_FILENAME | winsound.SND_ASYNC
                     )
                     return
             except (OSError, RuntimeError):
@@ -862,6 +1148,7 @@ class SubtitleApp:
             header,
             text="拖入文件，选择所需功能后即可处理。所有输出均会另存，不修改原文件。",
             style="Hint.TLabel",
+            wraplength=650,
         ).pack(side="left", padx=(18, 0), pady=(5, 0))
         ttk.Button(header, text="应用设置…", command=self._open_app_settings).pack(
             side="right"
@@ -869,64 +1156,66 @@ class SubtitleApp:
 
         mode_frame = ttk.LabelFrame(self.root, text="选择功能", padding=(10, 7))
         mode_frame.pack(fill="x", pady=(0, 9))
-        for column in range(4):
+        # Two balanced columns keep the long mode names visible even on a
+        # 1080p display or when Windows uses display scaling.
+        for column in range(2):
             mode_frame.columnconfigure(column, weight=1)
         ttk.Radiobutton(
             mode_frame,
-            text="完整识别：自动生成 A、B 和合并字幕",
+            text="完整识别：生成 A、B 与合并字幕",
             value="full",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ).grid(row=0, column=0, sticky="w", padx=(0, 18))
         ttk.Radiobutton(
             mode_frame,
-            text="仅生成字幕 A：只进行完整视频的第一轮日语识别",
+            text="仅生成字幕 A：完整视频第一轮识别",
             value="first_only",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=0, column=1, sticky="w", padx=(0, 12))
+        ).grid(row=0, column=1, sticky="w")
         ttk.Radiobutton(
             mode_frame,
-            text="补全模式：提供翻译字幕 A，仅生成日语字幕 B",
+            text="补全模式：提供字幕 A，仅生成字幕 B",
             value="second_only",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=0, column=2, sticky="w", padx=(0, 12))
+        ).grid(row=1, column=0, sticky="w", padx=(0, 18), pady=(4, 0))
         ttk.Radiobutton(
             mode_frame,
             text="合并字幕 A+B：逐项处理时间轴冲突",
             value="merge_subtitles",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=0, column=3, sticky="w")
+        ).grid(row=1, column=1, sticky="w", pady=(4, 0))
         ttk.Radiobutton(
             mode_frame,
             text="字幕拆分：中日双语字幕 → 仅中文字幕",
             value="split_chinese",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(5, 0))
+        ).grid(row=2, column=0, sticky="w", padx=(0, 18), pady=(4, 0))
         ttk.Radiobutton(
             mode_frame,
-            text="烧录字幕：转换为 MP4 并把选定 SRT 永久写入画面",
+            text="烧录字幕：转为 MP4 并永久写入所选 SRT",
             value="burn_subtitles",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(5, 0))
+        ).grid(row=2, column=1, sticky="w", pady=(4, 0))
         ttk.Radiobutton(
             mode_frame,
             text="下载 MP4：从链接下载兼容 MP4 视频",
             value="download_mp4",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=1, column=2, sticky="w", padx=(0, 12), pady=(5, 0))
+        ).grid(row=3, column=0, sticky="w", padx=(0, 18), pady=(4, 0))
         ttk.Radiobutton(
             mode_frame,
             text="清理可疑幻觉字幕：审核后手动删除",
             value="hallucination_cleanup",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=1, column=3, sticky="w", pady=(5, 0))
+        ).grid(row=3, column=1, sticky="w", pady=(4, 0))
 
         # Keep all mode-dependent inputs in one stable container.  Repacking
         # siblings of the whole window caused stale geometry and click areas
@@ -996,9 +1285,14 @@ class SubtitleApp:
         self.link_entry.pack(side="left", fill="x", expand=True)
 
         self.download_cookie_row = ttk.Frame(self.input_area)
-        ttk.Label(self.download_cookie_row, text="登录 Cookie", width=10).pack(
-            side="left"
-        )
+        cookie_label = ttk.Frame(self.download_cookie_row)
+        cookie_label.pack(side="left")
+        ttk.Label(cookie_label, text="登录 Cookie", width=10).pack(side="left")
+        help_button(
+            cookie_label,
+            "浏览器登录 Cookie",
+            MAIN_PARAMETER_HELP["download_cookie"],
+        ).pack(side="left", padx=(0, 6))
         self.download_cookie_box = ttk.Combobox(
             self.download_cookie_row,
             state="readonly",
@@ -1011,6 +1305,7 @@ class SubtitleApp:
             self.download_cookie_row,
             text="遇到 YouTube 验证时，选择本机已登录的浏览器。",
             style="Hint.TLabel",
+            wraplength=430,
         ).pack(side="left", padx=(10, 0))
 
         self.output_row = ttk.Frame(self.root)
@@ -1023,7 +1318,12 @@ class SubtitleApp:
 
         options = ttk.LabelFrame(self.root, text="处理设置", padding=(10, 7))
         options.pack(fill="x", pady=(7, 6))
-        ttk.Label(options, text="Whisper 模型").grid(row=0, column=0, sticky="w")
+        parameter_label(
+            options,
+            "Whisper 模型",
+            "Whisper 模型",
+            MAIN_PARAMETER_HELP["model"],
+        ).grid(row=0, column=0, sticky="w")
         self.model_box = ttk.Combobox(
             options,
             state="readonly",
@@ -1031,76 +1331,108 @@ class SubtitleApp:
             values=("tiny", "base", "small", "medium", "large-v2", "large-v3"),
             width=14,
         )
-        self.model_box.grid(row=0, column=1, sticky="w", padx=(8, 26))
+        self.model_box.grid(row=0, column=1, sticky="w", padx=(8, 20))
+        gpu_cell = ttk.Frame(options)
+        gpu_cell.grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 20))
         ttk.Checkbutton(
-            options,
+            gpu_cell,
             text="GPU 高性能模式（NVIDIA CUDA）",
             variable=self.gpu_acceleration,
-        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 24))
-        ttk.Label(options, text="合并间隔（秒）").grid(row=0, column=4, sticky="w")
+        ).pack(side="left")
+        help_button(
+            gpu_cell, "GPU 高性能模式", MAIN_PARAMETER_HELP["gpu"]
+        ).pack(side="left", padx=(5, 0))
+        parameter_label(
+            options,
+            "合并间隔（秒）",
+            "字幕 A 合并间隔",
+            MAIN_PARAMETER_HELP["merge_gap"],
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.gap_entry = ttk.Entry(options, textvariable=self.merge_gap, width=8)
-        self.gap_entry.grid(row=0, column=5, sticky="w", padx=(8, 26))
-        ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=6, sticky="w")
+        self.gap_entry.grid(row=1, column=1, sticky="w", padx=(8, 20), pady=(8, 0))
+        parameter_label(
+            options,
+            "去重阈值（秒）",
+            "A/B 去重时间阈值",
+            MAIN_PARAMETER_HELP["duplicate_threshold"],
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0))
         self.threshold_entry = ttk.Entry(options, textvariable=self.duplicate_threshold, width=8)
-        self.threshold_entry.grid(row=0, column=7, sticky="w", padx=(8, 0))
+        self.threshold_entry.grid(row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0))
+        silero_cell = ttk.Frame(options)
+        silero_cell.grid(row=2, column=0, columnspan=6, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
-            options,
-            text="启用 B 音频预筛（取消即保留所有反向剪裁 B 片段）",
-            variable=self.filter_silent_b,
-        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(options, text="预设").grid(row=1, column=2, sticky="e", padx=(14, 0), pady=(8, 0))
-        self.b_audio_preset_box = ttk.Combobox(
-            options,
-            state="readonly",
-            textvariable=self.b_audio_preset,
-            values=tuple(B_AUDIO_FILTER_PRESETS),
-            width=20,
-        )
-        self.b_audio_preset_box.grid(row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0))
-        self.b_audio_preset_box.bind("<<ComboboxSelected>>", self._apply_b_audio_preset)
+            silero_cell,
+            text="启用 Silero B 人声预筛（关闭时保留全部反向剪裁 B 片段）",
+            variable=self.filter_b_speech,
+        ).pack(side="left")
+        help_button(
+            silero_cell,
+            "Silero B 人声预筛开关",
+            MAIN_PARAMETER_HELP["silero_enabled"],
+        ).pack(side="left", padx=(5, 0))
         ttk.Button(
             options,
             text="第一/二轮 Whisper 高级参数…",
             command=self._show_whisper_options,
-        ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(12, 0), pady=(8, 0))
-        ttk.Label(options, text="RMS 下限").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(options, textvariable=self.b_audio_min_rms, width=8).grid(
-            row=2, column=1, sticky="w", padx=(8, 18), pady=(8, 0)
-        )
-        ttk.Label(options, text="最少有效音频（秒）").grid(row=2, column=2, sticky="w", pady=(8, 0))
-        ttk.Entry(options, textvariable=self.b_audio_min_active_seconds, width=8).grid(
-            row=2, column=3, sticky="w", padx=(8, 18), pady=(8, 0)
-        )
-        ttk.Label(options, text="静音判定 dB").grid(row=2, column=4, sticky="w", pady=(8, 0))
-        ttk.Entry(options, textvariable=self.b_audio_silence_top_db, width=6).grid(
-            row=2, column=5, sticky="w", padx=(8, 18), pady=(8, 0)
-        )
-        ttk.Checkbutton(
+        ).grid(row=0, column=4, columnspan=2, sticky="w")
+        parameter_label(
             options,
-            text="语音优先（跳过未检测到对白的 B 片段，实验性）",
-            variable=self.b_speech_only,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        ttk.Label(options, text="语音检测强度").grid(row=3, column=3, sticky="e", pady=(8, 0))
-        ttk.Combobox(
+            "人声概率阈值（0～1）",
+            "Silero 人声概率阈值",
+            MAIN_PARAMETER_HELP["silero_threshold"],
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(options, textvariable=self.b_silero_threshold, width=8).grid(
+            row=3, column=1, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        parameter_label(
             options,
-            state="readonly",
-            textvariable=self.b_vad_strength,
-            values=tuple(VAD_AGGRESSIVENESS),
-            width=8,
-        ).grid(row=3, column=4, sticky="w", padx=(8, 0), pady=(8, 0))
+            "最短累计人声（秒）",
+            "Silero 最短累计人声",
+            MAIN_PARAMETER_HELP["silero_min_seconds"],
+        ).grid(row=3, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(options, textvariable=self.b_silero_min_speech_seconds, width=8).grid(
+            row=3, column=3, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        parameter_label(
+            options,
+            "最小人声占比（%）",
+            "Silero 最小人声占比",
+            MAIN_PARAMETER_HELP["silero_min_ratio"],
+        ).grid(row=3, column=4, sticky="w", pady=(8, 0))
+        ttk.Entry(
+            options, textvariable=self.b_silero_min_speech_ratio_percent, width=6
+        ).grid(
+            row=3, column=5, sticky="w", padx=(8, 18), pady=(8, 0)
+        )
+        ttk.Label(
+            options,
+            text="阈值越低越不容易漏掉轻声对白；占比设为 0 表示只要求检测到最短累计人声。",
+            style="Hint.TLabel",
+            wraplength=820,
+        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(5, 0))
 
         self.burn_style_frame = ttk.LabelFrame(
             self.root, text="烧录字幕样式", padding=(10, 7)
         )
-        ttk.Label(self.burn_style_frame, text="字体").grid(row=0, column=0, sticky="w")
+        parameter_label(
+            self.burn_style_frame,
+            "字体",
+            "烧录字幕字体",
+            MAIN_PARAMETER_HELP["burn_font"],
+        ).grid(row=0, column=0, sticky="w")
         self.burn_font_box = ttk.Combobox(
             self.burn_style_frame,
             textvariable=self.burn_font_name,
             values=SUBTITLE_FONT_CHOICES,
             width=22,
         )
-        self.burn_font_box.grid(row=0, column=1, sticky="w", padx=(8, 22))
-        ttk.Label(self.burn_style_frame, text="颜色").grid(row=0, column=2, sticky="w")
+        self.burn_font_box.grid(row=0, column=1, sticky="w", padx=(8, 20))
+        parameter_label(
+            self.burn_style_frame,
+            "颜色",
+            "烧录字幕颜色",
+            MAIN_PARAMETER_HELP["burn_color"],
+        ).grid(row=0, column=2, sticky="w")
         self.burn_color_box = ttk.Combobox(
             self.burn_style_frame,
             state="readonly",
@@ -1108,23 +1440,40 @@ class SubtitleApp:
             values=tuple(SUBTITLE_COLOR_CHOICES),
             width=10,
         )
-        self.burn_color_box.grid(row=0, column=3, sticky="w", padx=(8, 22))
-        ttk.Label(self.burn_style_frame, text="字号").grid(row=0, column=4, sticky="w")
+        self.burn_color_box.grid(row=0, column=3, sticky="w", padx=(8, 20))
+        parameter_label(
+            self.burn_style_frame,
+            "字号",
+            "烧录字幕字号",
+            MAIN_PARAMETER_HELP["burn_size"],
+        ).grid(row=0, column=4, sticky="w")
         ttk.Entry(self.burn_style_frame, textvariable=self.burn_font_size, width=6).grid(
-            row=0, column=5, sticky="w", padx=(8, 22)
+            row=0, column=5, sticky="w", padx=(8, 20)
         )
-        ttk.Label(self.burn_style_frame, text="黑色描边").grid(row=0, column=6, sticky="w")
+        parameter_label(
+            self.burn_style_frame,
+            "黑色描边",
+            "烧录字幕黑色描边",
+            MAIN_PARAMETER_HELP["burn_outline"],
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(self.burn_style_frame, textvariable=self.burn_outline_size, width=6).grid(
-            row=0, column=7, sticky="w", padx=(8, 18)
+            row=1, column=1, sticky="w", padx=(8, 20), pady=(8, 0)
         )
-        ttk.Label(self.burn_style_frame, text="距底部").grid(row=0, column=8, sticky="w")
+        parameter_label(
+            self.burn_style_frame,
+            "距底部",
+            "烧录字幕底部距离",
+            MAIN_PARAMETER_HELP["burn_margin"],
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0))
         ttk.Entry(self.burn_style_frame, textvariable=self.burn_margin_v, width=6).grid(
-            row=0, column=9, sticky="w", padx=(8, 18)
+            row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0)
         )
         self.style_preview_button = ttk.Button(
             self.burn_style_frame, text="预览字幕样式", command=self._preview_burn_style
         )
-        self.style_preview_button.grid(row=0, column=10, sticky="w")
+        self.style_preview_button.grid(
+            row=1, column=4, columnspan=2, sticky="w", pady=(8, 0)
+        )
 
         self.preview_frame = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
         self.preview_frame.pack(fill="x", pady=(6, 7))
@@ -1133,7 +1482,7 @@ class SubtitleApp:
             textvariable=self.output_preview,
             justify="left",
             style="Hint.TLabel",
-            wraplength=1100,
+            wraplength=850,
         ).pack(anchor="w")
 
         button_row = ttk.Frame(self.root)
@@ -1264,15 +1613,27 @@ class SubtitleApp:
         self.start_button.configure(text=start_labels.get(mode, "开始提取字幕"))
         self._update_preview()
 
-    def _apply_b_audio_preset(self, _event=None) -> None:
-        """Fill the editable B audio gate fields from a user-selected preset."""
-        values = B_AUDIO_FILTER_PRESETS.get(self.b_audio_preset.get())
-        if values is None:
-            return
-        rms, active_seconds, top_db = values
-        self.b_audio_min_rms.set(rms)
-        self.b_audio_min_active_seconds.set(active_seconds)
-        self.b_audio_silence_top_db.set(top_db)
+    def _get_b_silero_values(self) -> tuple[float, float, float]:
+        """Validate Silero controls and convert the displayed percent to a ratio."""
+        if not self.filter_b_speech.get():
+            return (
+                B_SILERO_THRESHOLD,
+                B_SILERO_MIN_SPEECH_SECONDS,
+                B_SILERO_MIN_SPEECH_RATIO,
+            )
+        try:
+            threshold = float(self.b_silero_threshold.get())
+            min_speech_seconds = float(self.b_silero_min_speech_seconds.get())
+            ratio_percent = float(self.b_silero_min_speech_ratio_percent.get())
+        except ValueError as exc:
+            raise ValueError("Silero 的三个参数都必须是数字。") from exc
+        if not 0 <= threshold <= 1:
+            raise ValueError("人声概率阈值必须在 0 到 1 之间。")
+        if min_speech_seconds < 0:
+            raise ValueError("最短累计人声不能小于 0 秒。")
+        if not 0 <= ratio_percent <= 100:
+            raise ValueError("最小人声占比必须在 0% 到 100% 之间。")
+        return threshold, min_speech_seconds, ratio_percent / 100
 
     def _reset_input_area(self) -> None:
         """Remove every mode-specific widget before rebuilding the input order."""
@@ -1701,27 +2062,19 @@ class SubtitleApp:
                 messagebox.showwarning("设置不正确", "合并间隔和去重阈值必须是大于或等于 0 的数字。")
                 return
 
-        b_audio_min_rms, b_audio_min_active_seconds, b_audio_silence_top_db = 0.0001, 0.05, 45
-        # A VAD choice has no meaning without the master audio filter.  Freeze
-        # it as false here so an unchecked master switch always restores the
-        # original reverse-cut B behaviour.
-        b_speech_only = self.filter_silent_b.get() and self.b_speech_only.get()
-        vad_aggressiveness = VAD_AGGRESSIVENESS[self.b_vad_strength.get()]
-        if mode in ("full", "second_only") and self.filter_silent_b.get():
+        b_silero_threshold = B_SILERO_THRESHOLD
+        b_silero_min_speech_seconds = B_SILERO_MIN_SPEECH_SECONDS
+        b_silero_min_speech_ratio = B_SILERO_MIN_SPEECH_RATIO
+        if mode in ("full", "second_only"):
             try:
-                b_audio_min_rms = float(self.b_audio_min_rms.get())
-                b_audio_min_active_seconds = float(self.b_audio_min_active_seconds.get())
-                b_audio_silence_top_db = int(self.b_audio_silence_top_db.get())
-                if (
-                    b_audio_min_rms < 0
-                    or b_audio_min_active_seconds < 0
-                    or not 1 <= b_audio_silence_top_db <= 100
-                ):
-                    raise ValueError
-            except ValueError:
+                (
+                    b_silero_threshold,
+                    b_silero_min_speech_seconds,
+                    b_silero_min_speech_ratio,
+                ) = self._get_b_silero_values()
+            except ValueError as exc:
                 messagebox.showwarning(
-                    "B 音频预筛设置不正确",
-                    "RMS 和有效音频时长必须不小于 0；静音判定 dB 必须在 1 到 100 之间。",
+                    "Silero B 人声预筛设置不正确", str(exc)
                 )
                 return
 
@@ -1808,12 +2161,10 @@ class SubtitleApp:
                 self.gpu_acceleration.get(),
                 merge_gap,
                 duplicate_threshold,
-                self.filter_silent_b.get(),
-                b_audio_min_rms,
-                b_audio_min_active_seconds,
-                b_audio_silence_top_db,
-                b_speech_only,
-                vad_aggressiveness,
+                self.filter_b_speech.get(),
+                b_silero_threshold,
+                b_silero_min_speech_seconds,
+                b_silero_min_speech_ratio,
                 font_name,
                 font_size,
                 font_color,
@@ -1858,26 +2209,15 @@ class SubtitleApp:
             )
             return
 
-        b_audio_min_rms = 0.0001
-        b_audio_min_active_seconds = 0.05
-        b_audio_silence_top_db = 45
-        if self.filter_silent_b.get():
-            try:
-                b_audio_min_rms = float(self.b_audio_min_rms.get())
-                b_audio_min_active_seconds = float(self.b_audio_min_active_seconds.get())
-                b_audio_silence_top_db = int(self.b_audio_silence_top_db.get())
-                if (
-                    b_audio_min_rms < 0
-                    or b_audio_min_active_seconds < 0
-                    or not 1 <= b_audio_silence_top_db <= 100
-                ):
-                    raise ValueError
-            except ValueError:
-                messagebox.showwarning(
-                    "B 音频预筛设置不正确",
-                    "RMS 和有效音频时长必须不小于 0；静音判定 dB 必须在 1 到 100 之间。",
-                )
-                return
+        try:
+            (
+                b_silero_threshold,
+                b_silero_min_speech_seconds,
+                b_silero_min_speech_ratio,
+            ) = self._get_b_silero_values()
+        except ValueError as exc:
+            messagebox.showwarning("Silero B 人声预筛设置不正确", str(exc))
+            return
 
         paths = build_resumable_output_paths(video, output)
         resume = False
@@ -1917,12 +2257,10 @@ class SubtitleApp:
             "gpu_acceleration": self.gpu_acceleration.get(),
             "merge_gap": merge_gap,
             "duplicate_threshold": duplicate_threshold,
-            "filter_silent_b": self.filter_silent_b.get(),
-            "b_audio_min_rms": b_audio_min_rms,
-            "b_audio_min_active_seconds": b_audio_min_active_seconds,
-            "b_audio_silence_top_db": b_audio_silence_top_db,
-            "b_speech_only": self.filter_silent_b.get() and self.b_speech_only.get(),
-            "b_vad_aggressiveness": VAD_AGGRESSIVENESS[self.b_vad_strength.get()],
+            "filter_b_speech": self.filter_b_speech.get(),
+            "b_silero_threshold": b_silero_threshold,
+            "b_silero_min_speech_seconds": b_silero_min_speech_seconds,
+            "b_silero_min_speech_ratio": b_silero_min_speech_ratio,
             "first_whisper_values": self._snapshot_whisper_values(
                 self.first_whisper_values
             ),
@@ -2053,12 +2391,10 @@ class SubtitleApp:
         gpu_acceleration: bool,
         merge_gap: float,
         duplicate_threshold: float,
-        filter_silent_b: bool,
-        b_audio_min_rms: float,
-        b_audio_min_active_seconds: float,
-        b_audio_silence_top_db: int,
-        b_speech_only: bool,
-        vad_aggressiveness: int,
+        filter_b_speech: bool,
+        b_silero_threshold: float,
+        b_silero_min_speech_seconds: float,
+        b_silero_min_speech_ratio: float,
         font_name: str,
         font_size: int,
         font_color: str,
@@ -2079,12 +2415,10 @@ class SubtitleApp:
                         cpu_thread_profile=cpu_thread_profile,
                         gpu_acceleration=gpu_acceleration,
                         merge_gap=merge_gap,
-                        filter_silent_b=filter_silent_b,
-                        b_audio_min_rms=b_audio_min_rms,
-                        b_audio_min_active_seconds=b_audio_min_active_seconds,
-                        b_audio_silence_top_db=b_audio_silence_top_db,
-                        b_speech_only=b_speech_only,
-                        b_vad_aggressiveness=vad_aggressiveness,
+                        filter_b_speech=filter_b_speech,
+                        b_silero_threshold=b_silero_threshold,
+                        b_silero_min_speech_seconds=b_silero_min_speech_seconds,
+                        b_silero_min_speech_ratio=b_silero_min_speech_ratio,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
                         progress_callback=lambda stage, current, total: self.events.put(
@@ -2144,12 +2478,10 @@ class SubtitleApp:
                         gpu_acceleration=gpu_acceleration,
                         merge_gap=merge_gap,
                         duplicate_threshold=duplicate_threshold,
-                        filter_silent_b=filter_silent_b,
-                        b_audio_min_rms=b_audio_min_rms,
-                        b_audio_min_active_seconds=b_audio_min_active_seconds,
-                        b_audio_silence_top_db=b_audio_silence_top_db,
-                        b_speech_only=b_speech_only,
-                        b_vad_aggressiveness=vad_aggressiveness,
+                        filter_b_speech=filter_b_speech,
+                        b_silero_threshold=b_silero_threshold,
+                        b_silero_min_speech_seconds=b_silero_min_speech_seconds,
+                        b_silero_min_speech_ratio=b_silero_min_speech_ratio,
                         first_whisper_values=first_whisper_values,
                         second_whisper_values=second_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),

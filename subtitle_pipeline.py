@@ -7,12 +7,13 @@ actionable instead of failing when the window opens.
 
 from __future__ import annotations
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 import shutil
-import struct
 import subprocess
 import sys
+import tempfile
 import os
 from typing import Any, Callable, Mapping
 from SrtMerge import (
@@ -32,12 +33,13 @@ LogCallback = Callable[[str], None]
 ProgressCallback = Callable[[str, float, float], None]
 
 
-# Conservative B-pass audio gate.  The defaults intentionally reject only
-# near-digital silence, so quiet dialogue is not lost before Whisper sees it.
-B_AUDIO_MIN_RMS = 0.0001
-B_AUDIO_MIN_ACTIVE_SECONDS = 0.05
-B_AUDIO_SILENCE_TOP_DB = 45
-B_VAD_MIN_SPEECH_SECONDS = 0.09
+# Silero VAD defaults favour recall for quiet Japanese dialogue mixed with game
+# audio.  The filter remains opt-in, so disabling it preserves every B gap.
+B_SILERO_THRESHOLD = 0.4
+B_SILERO_MIN_SPEECH_SECONDS = 0.10
+B_SILERO_MIN_SPEECH_RATIO = 0.0
+B_SILERO_MIN_SILENCE_MS = 250
+B_SILERO_SPEECH_PAD_MS = 100
 
 # Browser names accepted by yt-dlp's --cookies-from-browser option.  The GUI
 # passes one of these identifiers only; it never exports or stores cookies.
@@ -232,10 +234,71 @@ def build_subtitle_preview_path(video_path: str | Path, output_dir: str | Path) 
 def build_manual_merge_path(
     subtitle_a_path: str | Path, subtitle_b_path: str | Path, output_dir: str | Path
 ) -> Path:
-    """Return a descriptive, non-destructive output name for a manual A+B merge."""
+    """Return a descriptive A+B output path that is safe for Windows/NAS paths."""
     subtitle_a = Path(subtitle_a_path)
     subtitle_b = Path(subtitle_b_path)
-    return Path(output_dir) / f"{subtitle_a.stem}_{subtitle_b.stem}_merged.srt"
+    destination = Path(output_dir)
+    a_base = _subtitle_source_stem(subtitle_a.stem)
+    b_base = _subtitle_source_stem(subtitle_b.stem)
+    # A generated B file commonly has ``<source>_A_B.srt`` while its supplied
+    # A file is ``<source>_A.srt``.  Both reduce to one source name instead of
+    # duplicating a potentially very long Japanese video title.
+    if a_base.casefold() == b_base.casefold():
+        source_stem = a_base
+    else:
+        source_stem = f"{a_base}_{b_base}"
+    filename = _safe_output_filename(destination, source_stem, "_merged.srt")
+    return destination / filename
+
+
+def _subtitle_source_stem(stem: str) -> str:
+    """Remove only known generated subtitle-role suffixes from a filename stem."""
+    result = stem.rstrip()
+    role_suffix = re.compile(r"_(?:A|B|merged|cleaned|zh)$", re.IGNORECASE)
+    while role_suffix.search(result):
+        result = role_suffix.sub("", result).rstrip()
+    return result or "subtitles"
+
+
+def _utf16_units(text: str) -> int:
+    """Count Windows filename units, including surrogate pairs correctly."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(text: str, maximum_units: int) -> str:
+    """Truncate without splitting a non-BMP Unicode character."""
+    output: list[str] = []
+    used = 0
+    for character in text:
+        units = _utf16_units(character)
+        if used + units > maximum_units:
+            break
+        output.append(character)
+        used += units
+    return "".join(output)
+
+
+def _safe_output_filename(destination: Path, stem: str, suffix: str) -> str:
+    """Bound one output component and, on Windows, the usual legacy full path."""
+    safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" ._")
+    safe_stem = safe_stem or "subtitles"
+    filename_budget = 220  # Below NTFS's 255 UTF-16-unit component limit.
+    if sys.platform.startswith("win"):
+        try:
+            directory_units = _utf16_units(str(destination.expanduser().resolve()))
+        except OSError:
+            directory_units = _utf16_units(str(destination))
+        # Stay below the traditional 260-character boundary where practical.
+        filename_budget = min(filename_budget, max(48, 240 - directory_units - 1))
+    raw_filename = f"{safe_stem}{suffix}"
+    if _utf16_units(raw_filename) <= filename_budget:
+        return raw_filename
+
+    digest = hashlib.sha256(stem.encode("utf-8")).hexdigest()[:8]
+    ending = f"_{digest}{suffix}"
+    prefix_budget = max(1, filename_budget - _utf16_units(ending))
+    shortened = _truncate_utf16(safe_stem, prefix_budget).rstrip(" ._")
+    return f"{shortened or 'subtitles'}{ending}"
 
 
 def build_hallucination_cleanup_path(
@@ -447,84 +510,146 @@ def _find_ffprobe() -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
-def filter_silent_b_segments(
+def _load_audio_mono_16k(
+    source: Path, librosa: Any, log_callback: LogCallback | None = None
+) -> tuple[Any, int]:
+    """Load analysis audio, falling back to FFmpeg for MP4/UNC incompatibilities.
+
+    Some SoundFile builds cannot open compressed video containers, especially
+    through a Windows UNC path, even though Whisper's FFmpeg loader can.  Keep
+    the established librosa path first, then decode a local PCM WAV only when
+    that backend rejects the source container.
+    """
+    try:
+        return librosa.load(str(source), sr=16_000, mono=True)
+    except (OSError, RuntimeError, ValueError) as direct_error:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            raise RuntimeError(
+                "音频后端无法读取视频，并且未找到可用于兼容解码的 FFmpeg。"
+            ) from direct_error
+        _log(
+            log_callback,
+            "当前音频后端无法直接读取该视频容器或网络路径，正在使用 FFmpeg 兼容解码…",
+        )
+        with tempfile.TemporaryDirectory(prefix="whisper_audio_decode_") as folder:
+            decoded_wav = Path(folder) / "audio_mono_16k.wav"
+            command = [
+                ffmpeg,
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(decoded_wav),
+            ]
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                    if sys.platform.startswith("win")
+                    else 0
+                ),
+            )
+            if completed.returncode != 0 or not decoded_wav.is_file():
+                detail = (completed.stderr or "FFmpeg 未生成解码音频。")[-1500:].strip()
+                raise RuntimeError(f"FFmpeg 无法从视频读取音频：\n{detail}") from direct_error
+            try:
+                audio_array, sample_rate = librosa.load(
+                    str(decoded_wav), sr=16_000, mono=True
+                )
+            except (OSError, RuntimeError, ValueError) as decoded_error:
+                raise RuntimeError("FFmpeg 已解码音频，但无法读取临时 WAV 文件。") from decoded_error
+        _log(log_callback, "FFmpeg 兼容解码完成，继续计算字幕 B 片段。")
+        return audio_array, sample_rate
+
+
+def filter_b_segments_with_silero(
     audio_segments: list[list[Any]],
     sample_rate: int,
-    librosa: Any,
+    torch: Any,
     *,
-    min_rms: float = B_AUDIO_MIN_RMS,
-    min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
-    silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
-    speech_only: bool = False,
-    vad_aggressiveness: int = 2,
+    threshold: float = B_SILERO_THRESHOLD,
+    min_speech_seconds: float = B_SILERO_MIN_SPEECH_SECONDS,
+    min_speech_ratio: float = B_SILERO_MIN_SPEECH_RATIO,
+    log_callback: LogCallback | None = None,
 ) -> tuple[list[list[Any]], list[tuple[float, float]]]:
-    """Keep B candidate slices that contain meaningful non-silent audio.
-
-    ``librosa.effects.split`` identifies active portions relative to the
-    segment's volume; RMS adds an absolute floor so digital silence is not
-    mistaken for audio.  If ``speech_only`` is requested, WebRTC VAD is used
-    after the volume test to prefer detected dialogue over music or ambience.
-    """
+    """Keep B slices containing speech detected by the Silero neural VAD."""
     kept_segments: list[list[Any]] = []
     skipped_intervals: list[tuple[float, float]] = []
-    if min_rms < 0 or min_active_seconds < 0 or not 1 <= silence_top_db <= 100:
-        raise ValueError("B 音频预筛阈值无效。")
-    if not 0 <= vad_aggressiveness <= 3:
-        raise ValueError("语音检测强度必须在 0 到 3 之间。")
+    if not 0 <= threshold <= 1:
+        raise ValueError("Silero 人声概率阈值必须在 0 到 1 之间。")
+    if min_speech_seconds < 0 or not 0 <= min_speech_ratio <= 1:
+        raise ValueError("Silero 最短人声必须不小于 0，人声占比必须在 0 到 1 之间。")
+    if sample_rate != 16_000:
+        raise ValueError("Silero B 预筛需要 16 kHz 单声道音频。")
+    try:
+        from silero_vad import get_speech_timestamps, load_silero_vad
+    except ImportError as exc:
+        raise RuntimeError(
+            "Silero 人声预筛需要 silero-vad。请在项目目录重新执行：\n"
+            "python -m pip install -r requirements.txt"
+        ) from exc
+
+    _log(log_callback, "正在加载 Silero VAD 人声检测模型（CPU）…")
+    try:
+        vad_model = load_silero_vad()
+    except Exception as exc:
+        raise RuntimeError(f"无法加载 Silero VAD 模型：{exc}") from exc
+
     for start, end, samples in audio_segments:
-        if len(samples) == 0:
+        duration = max(0.0, float(end) - float(start))
+        if len(samples) == 0 or duration <= 0:
             skipped_intervals.append((float(start), float(end)))
             continue
         try:
-            # NumPy audio arrays use this vectorized fast path.
-            rms = float(((samples * samples).mean()) ** 0.5)
-        except (AttributeError, TypeError):
-            # Keep the helper import-safe for lightweight test and GUI setups.
-            rms = (sum(float(sample) ** 2 for sample in samples) / len(samples)) ** 0.5
-        active_ranges = librosa.effects.split(
-            samples, top_db=silence_top_db
+            audio_tensor = torch.as_tensor(samples, dtype=torch.float32).flatten().cpu()
+            speech_ranges = get_speech_timestamps(
+                audio_tensor,
+                vad_model,
+                threshold=threshold,
+                sampling_rate=sample_rate,
+                min_speech_duration_ms=max(1, int(round(min_speech_seconds * 1000))),
+                min_silence_duration_ms=B_SILERO_MIN_SILENCE_MS,
+                speech_pad_ms=B_SILERO_SPEECH_PAD_MS,
+                return_seconds=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"Silero 无法检测 B 片段 {float(start):.1f}s–{float(end):.1f}s：{exc}"
+            ) from exc
+        speech_seconds = sum(
+            max(0.0, float(item["end"]) - float(item["start"]))
+            for item in speech_ranges
         )
-        active_seconds = sum(
-            (int(range_end) - int(range_start)) / sample_rate
-            for range_start, range_end in active_ranges
+        speech_ratio = speech_seconds / duration if duration else 0.0
+        keep = (
+            speech_seconds >= min_speech_seconds
+            and speech_ratio >= min_speech_ratio
         )
-        if rms < min_rms or active_seconds < min_active_seconds:
-            skipped_intervals.append((float(start), float(end)))
-        elif speech_only and _measure_speech_seconds(
-            samples, sample_rate, vad_aggressiveness
-        ) < B_VAD_MIN_SPEECH_SECONDS:
+        _log(
+            log_callback,
+            f"Silero B 检测 {float(start):.1f}s–{float(end):.1f}s："
+            f"人声 {speech_seconds:.2f}s / {duration:.2f}s"
+            f"（{speech_ratio * 100:.1f}%），{'保留' if keep else '跳过'}。",
+        )
+        if not keep:
             skipped_intervals.append((float(start), float(end)))
         else:
             kept_segments.append([start, end, samples])
     return kept_segments, skipped_intervals
-
-
-def _measure_speech_seconds(
-    samples: Any, sample_rate: int, aggressiveness: int
-) -> float:
-    """Estimate voiced time with WebRTC VAD without loading another ML model."""
-    if sample_rate not in (8_000, 16_000, 32_000, 48_000):
-        raise ValueError("语音检测仅支持 8/16/32/48 kHz 单声道音频。")
-    try:
-        import webrtcvad
-    except ImportError as exc:
-        raise RuntimeError(
-            "语音优先检测需要 webrtcvad-wheels。请在项目目录重新执行：\n"
-            "python -m pip install -r requirements.txt"
-        ) from exc
-
-    frame_samples = sample_rate * 30 // 1000
-    vad = webrtcvad.Vad(aggressiveness)
-    speech_seconds = 0.0
-    for offset in range(0, len(samples) - frame_samples + 1, frame_samples):
-        frame = samples[offset : offset + frame_samples]
-        pcm = struct.pack(
-            f"<{frame_samples}h",
-            *(int(max(-1.0, min(1.0, float(value))) * 32767) for value in frame),
-        )
-        if vad.is_speech(pcm, sample_rate):
-            speech_seconds += 0.03
-    return speech_seconds
 
 
 def run_two_pass_transcription(
@@ -534,12 +659,10 @@ def run_two_pass_transcription(
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
     duplicate_threshold: float = 0.5,
-    filter_silent_b: bool = False,
-    b_audio_min_rms: float = B_AUDIO_MIN_RMS,
-    b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
-    b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
-    b_speech_only: bool = False,
-    b_vad_aggressiveness: int = 2,
+    filter_b_speech: bool = False,
+    b_silero_threshold: float = B_SILERO_THRESHOLD,
+    b_silero_min_speech_seconds: float = B_SILERO_MIN_SPEECH_SECONDS,
+    b_silero_min_speech_ratio: float = B_SILERO_MIN_SPEECH_RATIO,
     cpu_thread_profile: str = "balanced",
     gpu_acceleration: bool = False,
     first_whisper_values: Mapping[str, Any] | None = None,
@@ -602,7 +725,7 @@ def run_two_pass_transcription(
     _progress(progress_callback, "subtitle_a", a_duration or 1, a_duration or 1)
 
     _log(log_callback, "正在读取音频并计算 A 未覆盖的片段…")
-    audio_array, sample_rate = librosa.load(str(source), sr=16_000, mono=True)
+    audio_array, sample_rate = _load_audio_mono_16k(source, librosa, log_callback)
     full_interval = [[0, len(audio_array) / sample_rate]]
     excluded_intervals = extract_time_intervals(
         str(outputs.first_pass), merge_gap=merge_gap
@@ -615,28 +738,25 @@ def run_two_pass_transcription(
         f"B 反向剪裁完成：得到 {len(audio_segments)} 个未覆盖片段。",
     )
 
-    if filter_silent_b and audio_segments:
-        audio_segments, skipped_intervals = filter_silent_b_segments(
+    if filter_b_speech and audio_segments:
+        audio_segments, skipped_intervals = filter_b_segments_with_silero(
             audio_segments,
             sample_rate,
-            librosa,
-            min_rms=b_audio_min_rms,
-            min_active_seconds=b_audio_min_active_seconds,
-            silence_top_db=b_audio_silence_top_db,
-            speech_only=b_speech_only,
-            vad_aggressiveness=b_vad_aggressiveness,
+            torch,
+            threshold=b_silero_threshold,
+            min_speech_seconds=b_silero_min_speech_seconds,
+            min_speech_ratio=b_silero_min_speech_ratio,
+            log_callback=log_callback,
         )
         if skipped_intervals:
             _log(
                 log_callback,
-                f"B 音频预筛：跳过 {len(skipped_intervals)} 个未覆盖片段"
-                f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
-                + ("，语音优先已开启）。" if b_speech_only else "）。"),
+                f"Silero B 人声预筛：跳过 {len(skipped_intervals)} 个未检测到足够人声的片段。",
             )
     elif audio_segments:
         _log(
             log_callback,
-            "B 音频预筛已关闭：保留全部反向剪裁出的 B 片段（与原始逻辑一致）。",
+            "Silero B 人声预筛已关闭：保留全部反向剪裁出的 B 片段。",
         )
 
     if audio_segments:
@@ -730,12 +850,10 @@ def run_second_pass_from_subtitle(
     *,
     model_name: str = "large-v2",
     merge_gap: float = 1.0,
-    filter_silent_b: bool = False,
-    b_audio_min_rms: float = B_AUDIO_MIN_RMS,
-    b_audio_min_active_seconds: float = B_AUDIO_MIN_ACTIVE_SECONDS,
-    b_audio_silence_top_db: int = B_AUDIO_SILENCE_TOP_DB,
-    b_speech_only: bool = False,
-    b_vad_aggressiveness: int = 2,
+    filter_b_speech: bool = False,
+    b_silero_threshold: float = B_SILERO_THRESHOLD,
+    b_silero_min_speech_seconds: float = B_SILERO_MIN_SPEECH_SECONDS,
+    b_silero_min_speech_ratio: float = B_SILERO_MIN_SPEECH_RATIO,
     cpu_thread_profile: str = "balanced",
     gpu_acceleration: bool = False,
     second_whisper_values: Mapping[str, Any] | None = None,
@@ -788,7 +906,7 @@ def run_second_pass_from_subtitle(
         second_options["fp16"] = True
 
     _log(log_callback, "正在读取视频，并按已有字幕 A 的时间轴寻找未覆盖片段…")
-    audio_array, sample_rate = librosa.load(str(source), sr=16_000, mono=True)
+    audio_array, sample_rate = _load_audio_mono_16k(source, librosa, log_callback)
     full_interval = [[0, len(audio_array) / sample_rate]]
     excluded_intervals = extract_time_intervals(str(subtitle_a), merge_gap=merge_gap)
     audio_segments, remaining_intervals = exclude_segments_by_intervals(
@@ -799,28 +917,25 @@ def run_second_pass_from_subtitle(
         f"B 反向剪裁完成：得到 {len(audio_segments)} 个未覆盖片段。",
     )
 
-    if filter_silent_b and audio_segments:
-        audio_segments, skipped_intervals = filter_silent_b_segments(
+    if filter_b_speech and audio_segments:
+        audio_segments, skipped_intervals = filter_b_segments_with_silero(
             audio_segments,
             sample_rate,
-            librosa,
-            min_rms=b_audio_min_rms,
-            min_active_seconds=b_audio_min_active_seconds,
-            silence_top_db=b_audio_silence_top_db,
-            speech_only=b_speech_only,
-            vad_aggressiveness=b_vad_aggressiveness,
+            torch,
+            threshold=b_silero_threshold,
+            min_speech_seconds=b_silero_min_speech_seconds,
+            min_speech_ratio=b_silero_min_speech_ratio,
+            log_callback=log_callback,
         )
         if skipped_intervals:
             _log(
                 log_callback,
-                f"B 音频预筛：跳过 {len(skipped_intervals)} 个未覆盖片段"
-                f"（RMS ≥ {b_audio_min_rms:g}，有效声音 ≥ {b_audio_min_active_seconds:g} 秒"
-                + ("，语音优先已开启）。" if b_speech_only else "）。"),
+                f"Silero B 人声预筛：跳过 {len(skipped_intervals)} 个未检测到足够人声的片段。",
             )
     elif audio_segments:
         _log(
             log_callback,
-            "B 音频预筛已关闭：保留全部反向剪裁出的 B 片段（与原始逻辑一致）。",
+            "Silero B 人声预筛已关闭：保留全部反向剪裁出的 B 片段。",
         )
 
     if audio_segments:

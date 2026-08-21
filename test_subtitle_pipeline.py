@@ -5,13 +5,19 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import patch
 
 import subtitle_pipeline
 import subtitle_gui
 import resumable_transcription
-from whisper_options import build_whisper_options, default_option_values
+from whisper_options import (
+    WHISPER_OPTION_HELP,
+    WHISPER_OPTION_SPECS,
+    build_whisper_options,
+    default_option_values,
+)
 from split_audio_by_intervals import split_audio_by_intervals
 
 
@@ -44,12 +50,6 @@ class _FakeTorch:
 
 
 class _FakeLibrosa:
-    class effects:
-        @staticmethod
-        def split(samples, top_db):
-            assert top_db == subtitle_pipeline.B_AUDIO_SILENCE_TOP_DB
-            return [[0, len(samples)]] if len(samples) else []
-
     @staticmethod
     def load(_source, sr, mono):
         assert sr == 16_000 and mono is True
@@ -57,6 +57,32 @@ class _FakeLibrosa:
 
 
 class SubtitlePipelineTests(unittest.TestCase):
+    def test_window_geometry_is_capped_to_available_screen_space(self):
+        class _FakeWindow:
+            geometry_value = ""
+            minimum_value = (0, 0)
+
+            @staticmethod
+            def winfo_screenwidth():
+                return 1000
+
+            @staticmethod
+            def winfo_screenheight():
+                return 700
+
+            @classmethod
+            def geometry(cls, value):
+                cls.geometry_value = value
+
+            @classmethod
+            def minsize(cls, width, height):
+                cls.minimum_value = (width, height)
+
+        subtitle_gui.fit_window_to_screen(_FakeWindow(), 1600, 900, 980, 700)
+
+        self.assertTrue(_FakeWindow.geometry_value.startswith("940x600+"))
+        self.assertEqual(_FakeWindow.minimum_value, (940, 600))
+
     def test_app_settings_round_trip_and_reject_invalid_values(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             settings_path = Path(temporary_directory) / "settings.json"
@@ -83,8 +109,34 @@ class SubtitlePipelineTests(unittest.TestCase):
 
             settings_path.write_text('{"ui_font_size": 100, "ui_theme": "无效"}', encoding="utf-8")
             recovered = subtitle_gui.load_app_settings(settings_path)
-            self.assertEqual(recovered["ui_font_size"], 14)
+            self.assertEqual(recovered["ui_font_size"], 12)
             self.assertEqual(recovered["ui_theme"], "浅色")
+
+            settings_path.write_text('{"ui_font_size": 14}', encoding="utf-8")
+            migrated = subtitle_gui.load_app_settings(settings_path)
+            self.assertEqual(migrated["ui_font_size"], 12)
+            self.assertEqual(
+                migrated["settings_version"], subtitle_gui.APP_SETTINGS_VERSION
+            )
+
+            settings_path.write_text('{"ui_font_size": 24}', encoding="utf-8")
+            oversized_legacy = subtitle_gui.load_app_settings(settings_path)
+            self.assertEqual(oversized_legacy["ui_font_size"], 18)
+
+            settings_path.write_text(
+                '{"settings_version": 2, "ui_font_size": 12, '
+                '"notification_sound": "系统提示音"}',
+                encoding="utf-8",
+            )
+            sound_migrated = subtitle_gui.load_app_settings(settings_path)
+            self.assertEqual(sound_migrated["ui_font_size"], 12)
+            self.assertEqual(sound_migrated["notification_sound"], "内置提示音")
+
+    def test_bundled_completion_sound_is_available(self):
+        self.assertEqual(
+            subtitle_gui.DEFAULT_APP_SETTINGS["notification_sound"], "内置提示音"
+        )
+        self.assertTrue(subtitle_gui.BUILTIN_NOTIFICATION_PATH.is_file())
 
     def test_cpu_thread_reservation_keeps_extra_macos_headroom(self):
         class _FakeTorch:
@@ -178,6 +230,14 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(options["suppress_tokens"], [-1, 50363])
         self.assertFalse(options["fp16"])
 
+    def test_every_whisper_option_has_detailed_example_help(self):
+        option_keys = {spec.key for spec in WHISPER_OPTION_SPECS}
+
+        self.assertEqual(set(WHISPER_OPTION_HELP), option_keys)
+        for help_text in WHISPER_OPTION_HELP.values():
+            self.assertIn("作用：", help_text)
+            self.assertIn("例子：", help_text)
+
     def test_empty_intervals_do_not_restore_full_audio_for_b(self):
         segments, intervals = split_audio_by_intervals([0.0] * 16_000, [], 16_000)
         self.assertEqual(segments, [])
@@ -189,25 +249,52 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(len(segments), 1)
         self.assertEqual(segments[0][:2], [0, 1.0])
 
-    def test_silent_b_audio_segments_are_skipped_before_transcription(self):
-        class _FilterLibrosa:
-            class effects:
-                @staticmethod
-                def split(samples, top_db):
-                    if max(abs(sample) for sample in samples) == 0:
-                        return []
-                    return [[0, len(samples)]]
+    def test_silero_b_filter_keeps_only_segments_with_enough_speech(self):
+        class _Tensor(list):
+            def flatten(self):
+                return self
 
-        kept, skipped = subtitle_pipeline.filter_silent_b_segments(
-            [
-                [0.0, 1.0, [0.0] * 16_000],
-                [1.0, 2.0, [0.02] * 16_000],
-            ],
-            16_000,
-            _FilterLibrosa,
+            def cpu(self):
+                return self
+
+        class _FilterTorch:
+            float32 = object()
+
+            @staticmethod
+            def as_tensor(samples, dtype):
+                assert dtype is _FilterTorch.float32
+                return _Tensor(samples)
+
+        model = object()
+
+        def get_speech_timestamps(audio, loaded_model, **options):
+            self.assertIs(loaded_model, model)
+            self.assertEqual(options["threshold"], 0.4)
+            if max(abs(sample) for sample in audio) == 0:
+                return []
+            return [{"start": 0.1, "end": 0.6}]
+
+        fake_silero = types.SimpleNamespace(
+            load_silero_vad=lambda: model,
+            get_speech_timestamps=get_speech_timestamps,
         )
+        logs = []
+        with patch.dict("sys.modules", {"silero_vad": fake_silero}):
+            kept, skipped = subtitle_pipeline.filter_b_segments_with_silero(
+                [
+                    [0.0, 1.0, [0.0] * 16_000],
+                    [1.0, 2.0, [0.02] * 16_000],
+                ],
+                16_000,
+                _FilterTorch,
+                threshold=0.4,
+                min_speech_seconds=0.1,
+                min_speech_ratio=0.2,
+                log_callback=logs.append,
+            )
         self.assertEqual([segment[:2] for segment in kept], [[1.0, 2.0]])
         self.assertEqual(skipped, [(0.0, 1.0)])
+        self.assertTrue(any("人声 0.50s" in message for message in logs))
 
     def test_burn_subtitles_builds_h264_mp4_command(self):
         class _FakeProcess:
@@ -444,6 +531,36 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertIn("B 独立", merged)
             self.assertNotIn("A 冲突", merged)
 
+    def test_manual_merge_path_does_not_duplicate_a_long_shared_video_name(self):
+        title = (
+            "20260821_【ゼンレスゾーンゼロ】どいつもこいつも愛でまくろう！！"
+            "「パシャリ！フォーカスの陣！」キュート編【Vtuber】"
+        )
+        output = subtitle_pipeline.build_manual_merge_path(
+            f"{title} _A.srt",
+            f"{title} _A_B.srt",
+            Path("字幕"),
+        )
+
+        self.assertEqual(output.name, f"{title}_merged.srt")
+        self.assertEqual(output.name.count(title), 1)
+
+    def test_manual_merge_path_truncates_extreme_names_with_stable_hash(self):
+        title = "非常长的日语直播标题" * 40
+        first = subtitle_pipeline.build_manual_merge_path(
+            f"{title}_A.srt", f"{title}_A_B.srt", Path("字幕")
+        )
+        second = subtitle_pipeline.build_manual_merge_path(
+            f"{title}_A.srt", f"{title}_A_B.srt", Path("字幕")
+        )
+
+        self.assertEqual(first, second)
+        self.assertLessEqual(
+            len(first.name.encode("utf-16-le")) // 2,
+            220,
+        )
+        self.assertRegex(first.name, r"_[0-9a-f]{8}_merged\.srt$")
+
     def test_parse_editable_srt_text_accepts_edited_srt(self):
         entries = subtitle_pipeline.parse_editable_srt_text(
             "1\n00:00:01,000 --> 00:00:02,500\n修改后的字幕\n"
@@ -495,6 +612,47 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(outputs.first_pass, Path("字幕") / "動画 01_A.srt")
         self.assertEqual(outputs.second_pass, Path("字幕") / "動画 01_B.srt")
         self.assertEqual(outputs.merged, Path("字幕") / "動画 01_merged.srt")
+
+    def test_audio_loader_falls_back_to_ffmpeg_for_unreadable_mp4(self):
+        class _ContainerRejectingLibrosa:
+            calls = []
+
+            @classmethod
+            def load(cls, source, sr, mono):
+                cls.calls.append(source)
+                assert sr == 16_000 and mono is True
+                if str(source).lower().endswith(".mp4"):
+                    raise RuntimeError("Format not recognised")
+                return [0.1, 0.2], sr
+
+        class _Completed:
+            returncode = 0
+            stderr = ""
+
+        commands = []
+
+        def fake_run(command, **_kwargs):
+            commands.append(command)
+            Path(command[-1]).touch()
+            return _Completed()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            source = Path(temporary_directory) / "网络视频.mp4"
+            source.touch()
+            logs = []
+            with (
+                patch("subtitle_pipeline.shutil.which", return_value="ffmpeg"),
+                patch("subtitle_pipeline.subprocess.run", side_effect=fake_run),
+            ):
+                audio, sample_rate = subtitle_pipeline._load_audio_mono_16k(
+                    source, _ContainerRejectingLibrosa, logs.append
+                )
+
+        self.assertEqual(audio, [0.1, 0.2])
+        self.assertEqual(sample_rate, 16_000)
+        self.assertEqual(commands[0][commands[0].index("-i") + 1], str(source))
+        self.assertIn("pcm_s16le", commands[0])
+        self.assertTrue(any("FFmpeg 兼容解码" in message for message in logs))
 
     def test_two_pass_workflow_writes_all_subtitles(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -738,12 +896,10 @@ class SubtitlePipelineTests(unittest.TestCase):
                 model_name="large-v2",
                 merge_gap=1.0,
                 duplicate_threshold=0.5,
-                filter_silent_b=False,
-                b_audio_min_rms=subtitle_pipeline.B_AUDIO_MIN_RMS,
-                b_audio_min_active_seconds=subtitle_pipeline.B_AUDIO_MIN_ACTIVE_SECONDS,
-                b_audio_silence_top_db=subtitle_pipeline.B_AUDIO_SILENCE_TOP_DB,
-                b_speech_only=False,
-                b_vad_aggressiveness=2,
+                filter_b_speech=False,
+                b_silero_threshold=subtitle_pipeline.B_SILERO_THRESHOLD,
+                b_silero_min_speech_seconds=subtitle_pipeline.B_SILERO_MIN_SPEECH_SECONDS,
+                b_silero_min_speech_ratio=subtitle_pipeline.B_SILERO_MIN_SPEECH_RATIO,
                 cpu_thread_profile="balanced",
                 gpu_acceleration=False,
                 first_whisper_values=None,
