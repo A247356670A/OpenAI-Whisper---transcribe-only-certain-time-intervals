@@ -41,6 +41,10 @@ from subtitle_pipeline import (
     SUBTITLE_COLOR_CHOICES,
     SUBTITLE_FONT_CHOICES,
 )
+from resumable_transcription import (
+    build_resumable_output_paths,
+    run_resumable_two_pass_transcription,
+)
 from whisper_options import WHISPER_OPTION_SPECS, default_option_values
 
 try:
@@ -631,6 +635,8 @@ class SubtitleApp:
         saved_settings = load_app_settings()
         self.events: Queue[tuple[str, object]] = Queue()
         self.running = False
+        self.resumable_running = False
+        self.resumable_cancel_event = threading.Event()
         # Tk's text widget is more sensitive to large, frequent inserts on
         # macOS. Smaller batches let AppKit process clicks and redraws between
         # log updates; retain the established Windows cadence unchanged.
@@ -1136,6 +1142,12 @@ class SubtitleApp:
             button_row, text="开始提取字幕", command=self._start, style="Accent.TButton"
         )
         self.start_button.pack(side="left")
+        self.resumable_button = ttk.Button(
+            button_row,
+            text="可取消/续传 A+B",
+            command=self._start_or_cancel_resumable,
+        )
+        self.resumable_button.pack(side="left", padx=(8, 0))
         self.open_button = ttk.Button(
             button_row, text="打开保存文件夹", command=self._open_output_directory
         )
@@ -1768,6 +1780,7 @@ class SubtitleApp:
         self.running = True
         self._start_elapsed_timer()
         self.start_button.configure(state="disabled")
+        self.resumable_button.configure(state="disabled")
         self.status.set("正在处理，请保持此窗口打开…")
         self._set_progress("preparing", 0, 0)
         self._append_log("=" * 54)
@@ -1812,6 +1825,128 @@ class SubtitleApp:
             daemon=True,
         )
         worker.start()
+
+    def _start_or_cancel_resumable(self) -> None:
+        """Start the opt-in checkpoint workflow, or request its safe cancellation."""
+        if self.resumable_running:
+            self.resumable_cancel_event.set()
+            self.resumable_button.configure(text="正在安全取消…", state="disabled")
+            self.status.set("取消请求已收到；正在保存当前完整片段…")
+            self._append_log(
+                "取消请求已收到。Whisper 当前分片完成后会写入断点并停止，请勿关闭窗口。"
+            )
+            return
+        if self.running:
+            return
+
+        video = self.video_path.get().strip()
+        output = self.output_dir.get().strip()
+        if not video:
+            messagebox.showwarning("请选择视频", "请先拖入视频文件，或点击“选择视频”。")
+            return
+        if not output:
+            messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
+            return
+        try:
+            merge_gap = float(self.merge_gap.get())
+            duplicate_threshold = float(self.duplicate_threshold.get())
+            if merge_gap < 0 or duplicate_threshold < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning(
+                "设置不正确", "合并间隔和去重阈值必须是大于或等于 0 的数字。"
+            )
+            return
+
+        b_audio_min_rms = 0.0001
+        b_audio_min_active_seconds = 0.05
+        b_audio_silence_top_db = 45
+        if self.filter_silent_b.get():
+            try:
+                b_audio_min_rms = float(self.b_audio_min_rms.get())
+                b_audio_min_active_seconds = float(self.b_audio_min_active_seconds.get())
+                b_audio_silence_top_db = int(self.b_audio_silence_top_db.get())
+                if (
+                    b_audio_min_rms < 0
+                    or b_audio_min_active_seconds < 0
+                    or not 1 <= b_audio_silence_top_db <= 100
+                ):
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning(
+                    "B 音频预筛设置不正确",
+                    "RMS 和有效音频时长必须不小于 0；静音判定 dB 必须在 1 到 100 之间。",
+                )
+                return
+
+        paths = build_resumable_output_paths(video, output)
+        resume = False
+        if paths.checkpoint.is_file():
+            choice = messagebox.askyesnocancel(
+                "发现可续传断点",
+                "检测到这个视频以前保存的断点。\n\n"
+                "选择“是”：从断点继续\n"
+                "选择“否”：放弃旧进度并重新开始\n"
+                "选择“取消”：不运行",
+            )
+            if choice is None:
+                return
+            resume = bool(choice)
+        else:
+            existing = [
+                path.name
+                for path in (
+                    paths.first_pass,
+                    paths.second_pass,
+                    paths.merged,
+                    paths.partial_first,
+                    paths.partial_second,
+                )
+                if path.exists()
+            ]
+            if existing and not messagebox.askyesno(
+                "确认覆盖断点模式输出",
+                "以下断点模式文件已存在，重新开始会覆盖它们：\n\n"
+                + "\n".join(existing),
+            ):
+                return
+
+        options = {
+            "model_name": self.model_name.get(),
+            "cpu_thread_profile": self.cpu_thread_profile.get(),
+            "gpu_acceleration": self.gpu_acceleration.get(),
+            "merge_gap": merge_gap,
+            "duplicate_threshold": duplicate_threshold,
+            "filter_silent_b": self.filter_silent_b.get(),
+            "b_audio_min_rms": b_audio_min_rms,
+            "b_audio_min_active_seconds": b_audio_min_active_seconds,
+            "b_audio_silence_top_db": b_audio_silence_top_db,
+            "b_speech_only": self.filter_silent_b.get() and self.b_speech_only.get(),
+            "b_vad_aggressiveness": VAD_AGGRESSIVENESS[self.b_vad_strength.get()],
+            "first_whisper_values": self._snapshot_whisper_values(
+                self.first_whisper_values
+            ),
+            "second_whisper_values": self._snapshot_whisper_values(
+                self.second_whisper_values
+            ),
+        }
+        self.resumable_cancel_event.clear()
+        self.running = True
+        self.resumable_running = True
+        self._start_elapsed_timer()
+        self.start_button.configure(state="disabled")
+        self.resumable_button.configure(text="取消并保存断点", state="normal")
+        self.status.set("可续传 A+B 正在运行…")
+        self._set_progress("preparing", 0, 0)
+        self._append_log("=" * 54)
+        self._append_log(
+            ("继续断点任务" if resume else "开始新的可取消/续传任务") + f"：{video}"
+        )
+        threading.Thread(
+            target=self._run_resumable_worker,
+            args=(video, output, resume, options),
+            daemon=True,
+        ).start()
 
     def _start_manual_subtitle_merge(
         self, subtitle_a: str, subtitle_b: str, output: str
@@ -1876,6 +2011,34 @@ class SubtitleApp:
     def _snapshot_whisper_values(values: dict[str, tk.StringVar]) -> dict[str, str]:
         """Freeze editable Tk variables before the background thread starts."""
         return {key: value.get() for key, value in values.items()}
+
+    def _run_resumable_worker(
+        self,
+        video: str,
+        output: str,
+        resume: bool,
+        options: dict[str, object],
+    ) -> None:
+        """Run only the new checkpoint pipeline; legacy worker paths stay untouched."""
+        writer = _QueueWriter(self.events)
+        try:
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                result = run_resumable_two_pass_transcription(
+                    video,
+                    output,
+                    resume=resume,
+                    cancel_check=self.resumable_cancel_event.is_set,
+                    log_callback=lambda message: self.events.put(("log", message)),
+                    progress_callback=lambda stage, current, total: self.events.put(
+                        ("progress", (stage, current, total))
+                    ),
+                    **options,
+                )
+            event_type = "success" if result.completed else "cancelled"
+            payload: object = ("resumable_full", result) if result.completed else result
+            self.events.put((event_type, payload))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
 
     def _run_worker(
         self,
@@ -2038,15 +2201,28 @@ class SubtitleApp:
                     self._append_log_batch(log_messages)
                     log_messages.clear()
                     self.running = False
+                    self.resumable_running = False
+                    self.resumable_cancel_event.clear()
                     elapsed = self._stop_elapsed_timer()
                     self.start_button.configure(state="normal")
+                    self.resumable_button.configure(
+                        text="可取消/续传 A+B", state="normal"
+                    )
                     mode, result = payload
                     self.status.set("处理完成。")
                     self._finish_progress()
                     self._append_log(f"全部完成。实际运行时间：{elapsed}")
                     self._notify_task_complete()
                     elapsed_suffix = f"\n\n实际运行时间：{elapsed}"
-                    if mode == "second_only":
+                    if mode == "resumable_full":
+                        messagebox.showinfo(
+                            "可续传字幕已生成",
+                            "断点任务已全部完成，断点文件已自动清理。\n\n"
+                            f"字幕 A：{result.first_pass}\n"
+                            f"字幕 B：{result.second_pass}\n"
+                            f"合并字幕：{result.merged}{elapsed_suffix}",
+                        )
+                    elif mode == "second_only":
                         messagebox.showinfo(
                             "字幕 B 已生成",
                             f"日语补全字幕 B 已保存到：\n{result.second_pass}{elapsed_suffix}",
@@ -2076,12 +2252,42 @@ class SubtitleApp:
                             "字幕已生成",
                             f"合并字幕已保存到：\n{result.merged}{elapsed_suffix}",
                         )
+                elif event_type == "cancelled":
+                    self._append_log_batch(log_messages)
+                    log_messages.clear()
+                    self.running = False
+                    self.resumable_running = False
+                    self.resumable_cancel_event.clear()
+                    elapsed = self._stop_elapsed_timer()
+                    self.start_button.configure(state="normal")
+                    self.resumable_button.configure(
+                        text="可取消/续传 A+B", state="normal"
+                    )
+                    self.status.set("任务已安全取消，断点已经保存。")
+                    self.progress_text.set("已取消：完整片段和断点已保存。")
+                    self._append_log(f"任务已安全取消。实际运行时间：{elapsed}")
+                    self._notify_task_complete()
+                    result = payload
+                    messagebox.showinfo(
+                        "断点已保存",
+                        "任务已在完整分片边界安全停止。再次选择同一个视频并点击"
+                        "“可取消/续传 A+B”即可继续。\n\n"
+                        f"断点文件：{result.checkpoint}\n"
+                        f"字幕 A 临时结果：{result.partial_first}\n"
+                        f"字幕 B 临时结果：{result.partial_second}\n\n"
+                        f"实际运行时间：{elapsed}",
+                    )
                 elif event_type == "error":
                     self._append_log_batch(log_messages)
                     log_messages.clear()
                     self.running = False
+                    self.resumable_running = False
+                    self.resumable_cancel_event.clear()
                     elapsed = self._stop_elapsed_timer()
                     self.start_button.configure(state="normal")
+                    self.resumable_button.configure(
+                        text="可取消/续传 A+B", state="normal"
+                    )
                     self.status.set("处理失败，请查看运行日志。")
                     self.progress_text.set("处理失败。")
                     self._append_log(f"错误：{payload}\n实际运行时间：{elapsed}")
@@ -2120,6 +2326,8 @@ class SubtitleApp:
             "preparing": "正在准备",
             "subtitle_a": "字幕 A",
             "subtitle_b": "字幕 B",
+            "resumable_a": "可续传字幕 A",
+            "resumable_b": "可续传字幕 B",
             "download": "视频下载",
             "burn": "字幕烧录",
         }
@@ -2131,9 +2339,9 @@ class SubtitleApp:
             return
         percentage = max(0.0, min(100.0, current / total * 100))
         self.progress_value.set(percentage)
-        if stage == "subtitle_a":
+        if stage in ("subtitle_a", "resumable_a"):
             detail = f"{self._format_seconds(current)} / {self._format_seconds(total)}"
-        elif stage == "subtitle_b":
+        elif stage in ("subtitle_b", "resumable_b"):
             detail = f"片段 {int(current)} / {int(total)}"
         elif stage == "burn":
             detail = f"帧 {int(current):,} / {int(total):,}"

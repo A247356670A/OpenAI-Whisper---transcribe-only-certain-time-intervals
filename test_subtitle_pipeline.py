@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
 import subtitle_pipeline
 import subtitle_gui
+import resumable_transcription
 from whisper_options import build_whisper_options, default_option_values
 from split_audio_by_intervals import split_audio_by_intervals
 
@@ -620,6 +622,150 @@ class SubtitlePipelineTests(unittest.TestCase):
                 "1\n00:00:00,000 --> 00:00:02,000\n中文第一行\n\n"
                 "2\n00:00:03,000 --> 00:00:04,000\n第二句中文\n",
             )
+
+    def test_resumable_workflow_cancels_at_complete_chunk_and_resumes(self):
+        class _ResumableLibrosa(_FakeLibrosa):
+            @staticmethod
+            def load(_source, sr, mono):
+                assert sr == 16_000 and mono is True
+                return [0.02] * (sr * 6), sr
+
+        class _ResumableModel:
+            def transcribe(self, _audio, **_options):
+                return {
+                    "segments": [
+                        {"start": 0.2, "end": 0.8, "text": "分片字幕"},
+                    ]
+                }
+
+        class _ResumableWhisper:
+            @staticmethod
+            def load_model(_name, device):
+                assert device == "cpu"
+                return _ResumableModel()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            source = folder / "可续传视频.mp4"
+            source.touch()
+            cancel_event = threading.Event()
+
+            def cancel_after_first_chunk(stage, current, _total):
+                if stage == "resumable_a" and current >= 2:
+                    cancel_event.set()
+
+            with (
+                patch("resumable_transcription.shutil.which", return_value="ffmpeg"),
+                patch(
+                    "resumable_transcription._import_dependencies",
+                    return_value=(_ResumableLibrosa, _FakeTorch, _ResumableWhisper),
+                ),
+            ):
+                cancelled = resumable_transcription.run_resumable_two_pass_transcription(
+                    source,
+                    folder,
+                    resume=False,
+                    cancel_check=cancel_event.is_set,
+                    progress_callback=cancel_after_first_chunk,
+                    merge_gap=0,
+                    a_chunk_seconds=2,
+                    a_overlap_seconds=0.5,
+                )
+
+            self.assertFalse(cancelled.completed)
+            self.assertTrue(cancelled.checkpoint.is_file())
+            self.assertTrue(cancelled.partial_first.is_file())
+
+            cancel_event.clear()
+
+            def cancel_after_first_b_segment(stage, current, _total):
+                if stage == "resumable_b" and current >= 1:
+                    cancel_event.set()
+
+            with (
+                patch("resumable_transcription.shutil.which", return_value="ffmpeg"),
+                patch(
+                    "resumable_transcription._import_dependencies",
+                    return_value=(_ResumableLibrosa, _FakeTorch, _ResumableWhisper),
+                ),
+            ):
+                completed = resumable_transcription.run_resumable_two_pass_transcription(
+                    source,
+                    folder,
+                    resume=True,
+                    cancel_check=cancel_event.is_set,
+                    progress_callback=cancel_after_first_b_segment,
+                    merge_gap=0,
+                    a_chunk_seconds=2,
+                    a_overlap_seconds=0.5,
+                )
+
+            self.assertFalse(completed.completed)
+            self.assertTrue(completed.partial_second.is_file())
+            cancel_event.clear()
+            with (
+                patch("resumable_transcription.shutil.which", return_value="ffmpeg"),
+                patch(
+                    "resumable_transcription._import_dependencies",
+                    return_value=(_ResumableLibrosa, _FakeTorch, _ResumableWhisper),
+                ),
+            ):
+                completed = resumable_transcription.run_resumable_two_pass_transcription(
+                    source,
+                    folder,
+                    resume=True,
+                    cancel_check=cancel_event.is_set,
+                    merge_gap=0,
+                    a_chunk_seconds=2,
+                    a_overlap_seconds=0.5,
+                )
+
+            self.assertTrue(completed.completed)
+            self.assertTrue(completed.first_pass.is_file())
+            self.assertTrue(completed.second_pass.is_file())
+            self.assertTrue(completed.merged.is_file())
+            self.assertFalse(completed.checkpoint.exists())
+            self.assertFalse(completed.partial_first.exists())
+            self.assertFalse(completed.partial_second.exists())
+
+    def test_resumable_checkpoint_rejects_changed_parameters(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            source = folder / "参数检查.mp4"
+            source.touch()
+            paths = resumable_transcription.build_resumable_output_paths(source, folder)
+            settings = resumable_transcription._settings_identity(
+                model_name="large-v2",
+                merge_gap=1.0,
+                duplicate_threshold=0.5,
+                filter_silent_b=False,
+                b_audio_min_rms=subtitle_pipeline.B_AUDIO_MIN_RMS,
+                b_audio_min_active_seconds=subtitle_pipeline.B_AUDIO_MIN_ACTIVE_SECONDS,
+                b_audio_silence_top_db=subtitle_pipeline.B_AUDIO_SILENCE_TOP_DB,
+                b_speech_only=False,
+                b_vad_aggressiveness=2,
+                cpu_thread_profile="balanced",
+                gpu_acceleration=False,
+                first_whisper_values=None,
+                second_whisper_values=None,
+                a_chunk_seconds=2,
+                a_overlap_seconds=0.5,
+            )
+            state = resumable_transcription._fresh_checkpoint(source.resolve(), settings)
+            resumable_transcription._write_json_atomic(paths.checkpoint, state)
+
+            with (
+                patch("resumable_transcription.shutil.which", return_value="ffmpeg"),
+                self.assertRaisesRegex(ValueError, "参数与断点不一致"),
+            ):
+                resumable_transcription.run_resumable_two_pass_transcription(
+                    source,
+                    folder,
+                    resume=True,
+                    model_name="small",
+                    a_chunk_seconds=2,
+                    a_overlap_seconds=0.5,
+                )
 
 
 if __name__ == "__main__":
