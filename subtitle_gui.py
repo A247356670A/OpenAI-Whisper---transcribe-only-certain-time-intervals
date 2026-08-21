@@ -13,6 +13,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
@@ -661,6 +662,7 @@ class SubtitleApp:
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
         self.model_name = tk.StringVar(value="large-v2")
+        self.gpu_acceleration = tk.BooleanVar(value=False)
         self.merge_gap = tk.StringVar(value="1.0")
         self.duplicate_threshold = tk.StringVar(value="0.5")
         # Opt-in only: unchecked means the exact pre-filter B workflow, where
@@ -680,8 +682,11 @@ class SubtitleApp:
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="等待开始。")
+        self.elapsed_text = tk.StringVar(value="已运行：00:00:00")
         self._progress_stage = ""
         self._progress_total = 0.0
+        self._task_started_at: float | None = None
+        self._timer_after_id: str | None = None
         self.first_whisper_values = {
             key: tk.StringVar(value=value)
             for key, value in default_option_values("first").items()
@@ -1021,12 +1026,17 @@ class SubtitleApp:
             width=14,
         )
         self.model_box.grid(row=0, column=1, sticky="w", padx=(8, 26))
-        ttk.Label(options, text="合并间隔（秒）").grid(row=0, column=2, sticky="w")
+        ttk.Checkbutton(
+            options,
+            text="GPU 高性能模式（NVIDIA CUDA）",
+            variable=self.gpu_acceleration,
+        ).grid(row=0, column=2, columnspan=2, sticky="w", padx=(0, 24))
+        ttk.Label(options, text="合并间隔（秒）").grid(row=0, column=4, sticky="w")
         self.gap_entry = ttk.Entry(options, textvariable=self.merge_gap, width=8)
-        self.gap_entry.grid(row=0, column=3, sticky="w", padx=(8, 26))
-        ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=4, sticky="w")
+        self.gap_entry.grid(row=0, column=5, sticky="w", padx=(8, 26))
+        ttk.Label(options, text="去重阈值（秒）").grid(row=0, column=6, sticky="w")
         self.threshold_entry = ttk.Entry(options, textvariable=self.duplicate_threshold, width=8)
-        self.threshold_entry.grid(row=0, column=5, sticky="w", padx=(8, 0))
+        self.threshold_entry.grid(row=0, column=7, sticky="w", padx=(8, 0))
         ttk.Checkbutton(
             options,
             text="启用 B 音频预筛（取消即保留所有反向剪裁 B 片段）",
@@ -1135,18 +1145,33 @@ class SubtitleApp:
             side="right"
         )
 
+        # Keep the potentially long stage description on its own row.  A fixed
+        # width label beside the bar used to clip the trailing percentage.
+        progress_info_row = ttk.Frame(self.root)
+        progress_info_row.pack(fill="x", pady=(0, 3))
+        ttk.Label(
+            progress_info_row,
+            textvariable=self.progress_text,
+            style="Hint.TLabel",
+            anchor="w",
+        ).pack(fill="x")
+
         progress_row = ttk.Frame(self.root)
         progress_row.pack(fill="x", pady=(0, 7))
-        ttk.Label(progress_row, textvariable=self.progress_text, style="Hint.TLabel", width=26).pack(
-            side="left"
-        )
         self.progress_bar = ttk.Progressbar(
             progress_row,
             variable=self.progress_value,
             maximum=100,
             mode="determinate",
         )
-        self.progress_bar.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        self.progress_bar.pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            progress_row,
+            textvariable=self.elapsed_text,
+            style="Hint.TLabel",
+            width=20,
+            anchor="e",
+        ).pack(side="right", padx=(12, 0))
 
         log_box = ttk.LabelFrame(self.root, text="运行日志", padding=7)
         log_box.pack(fill="both", expand=True)
@@ -1741,6 +1766,7 @@ class SubtitleApp:
             font_name, font_size, font_color, outline_size, margin_v = "微软雅黑", 16, "白色", 0.8, 10
 
         self.running = True
+        self._start_elapsed_timer()
         self.start_button.configure(state="disabled")
         self.status.set("正在处理，请保持此窗口打开…")
         self._set_progress("preparing", 0, 0)
@@ -1766,6 +1792,7 @@ class SubtitleApp:
                 output,
                 self.model_name.get(),
                 self.cpu_thread_profile.get(),
+                self.gpu_acceleration.get(),
                 merge_gap,
                 duplicate_threshold,
                 self.filter_silent_b.get(),
@@ -1860,6 +1887,7 @@ class SubtitleApp:
         output: str,
         model_name: str,
         cpu_thread_profile: str,
+        gpu_acceleration: bool,
         merge_gap: float,
         duplicate_threshold: float,
         filter_silent_b: bool,
@@ -1886,6 +1914,7 @@ class SubtitleApp:
                         output,
                         model_name=model_name,
                         cpu_thread_profile=cpu_thread_profile,
+                        gpu_acceleration=gpu_acceleration,
                         merge_gap=merge_gap,
                         filter_silent_b=filter_silent_b,
                         b_audio_min_rms=b_audio_min_rms,
@@ -1905,6 +1934,7 @@ class SubtitleApp:
                         output,
                         model_name=model_name,
                         cpu_thread_profile=cpu_thread_profile,
+                        gpu_acceleration=gpu_acceleration,
                         first_whisper_values=first_whisper_values,
                         log_callback=lambda message: self.events.put(("log", message)),
                         progress_callback=lambda stage, current, total: self.events.put(
@@ -1948,6 +1978,7 @@ class SubtitleApp:
                         output,
                         model_name=model_name,
                         cpu_thread_profile=cpu_thread_profile,
+                        gpu_acceleration=gpu_acceleration,
                         merge_gap=merge_gap,
                         duplicate_threshold=duplicate_threshold,
                         filter_silent_b=filter_silent_b,
@@ -2007,48 +2038,56 @@ class SubtitleApp:
                     self._append_log_batch(log_messages)
                     log_messages.clear()
                     self.running = False
+                    elapsed = self._stop_elapsed_timer()
                     self.start_button.configure(state="normal")
                     mode, result = payload
                     self.status.set("处理完成。")
                     self._finish_progress()
-                    self._append_log("全部完成。")
+                    self._append_log(f"全部完成。实际运行时间：{elapsed}")
                     self._notify_task_complete()
+                    elapsed_suffix = f"\n\n实际运行时间：{elapsed}"
                     if mode == "second_only":
                         messagebox.showinfo(
-                            "字幕 B 已生成", f"日语补全字幕 B 已保存到：\n{result.second_pass}"
+                            "字幕 B 已生成",
+                            f"日语补全字幕 B 已保存到：\n{result.second_pass}{elapsed_suffix}",
                         )
                     elif mode == "first_only":
                         messagebox.showinfo(
-                            "字幕 A 已生成", f"第一轮日语字幕 A 已保存到：\n{result.first_pass}"
+                            "字幕 A 已生成",
+                            f"第一轮日语字幕 A 已保存到：\n{result.first_pass}{elapsed_suffix}",
                         )
                     elif mode == "split_chinese":
                         messagebox.showinfo(
                             "中文字幕已提取",
-                            f"仅中文字幕已保存到：\n{result.chinese_only}",
+                            f"仅中文字幕已保存到：\n{result.chinese_only}{elapsed_suffix}",
                         )
                     elif mode == "burn_subtitles":
                         messagebox.showinfo(
                             "MP4 已生成",
-                            f"字幕已永久烧录到画面：\n{result.burned_video}",
+                            f"字幕已永久烧录到画面：\n{result.burned_video}{elapsed_suffix}",
                         )
                     elif mode == "download_mp4":
                         messagebox.showinfo(
                             "MP4 下载完成",
-                            f"视频与 JPG 封面已保存到：\n{result.output_dir}",
+                            f"视频与 JPG 封面已保存到：\n{result.output_dir}{elapsed_suffix}",
                         )
                     else:
                         messagebox.showinfo(
-                            "字幕已生成", f"合并字幕已保存到：\n{result.merged}"
+                            "字幕已生成",
+                            f"合并字幕已保存到：\n{result.merged}{elapsed_suffix}",
                         )
                 elif event_type == "error":
                     self._append_log_batch(log_messages)
                     log_messages.clear()
                     self.running = False
+                    elapsed = self._stop_elapsed_timer()
                     self.start_button.configure(state="normal")
                     self.status.set("处理失败，请查看运行日志。")
                     self.progress_text.set("处理失败。")
-                    self._append_log(f"错误：{payload}")
-                    messagebox.showerror("处理失败", str(payload))
+                    self._append_log(f"错误：{payload}\n实际运行时间：{elapsed}")
+                    messagebox.showerror(
+                        "处理失败", f"{payload}\n\n实际运行时间：{elapsed}"
+                    )
         except Empty:
             pass
         self._append_log_batch(log_messages)
@@ -2139,6 +2178,38 @@ class SubtitleApp:
         hours, remainder = divmod(seconds, 3600)
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+    def _start_elapsed_timer(self) -> None:
+        """Start a monotonic, wall-clock timer for the newly launched task."""
+        if self._timer_after_id is not None:
+            self.root.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        self._task_started_at = time.monotonic()
+        self.elapsed_text.set("已运行：00:00:00")
+        self._timer_after_id = self.root.after(1000, self._update_elapsed_timer)
+
+    def _update_elapsed_timer(self) -> None:
+        """Refresh the elapsed label without blocking Tk's event loop."""
+        self._timer_after_id = None
+        if self._task_started_at is None:
+            return
+        elapsed = time.monotonic() - self._task_started_at
+        self.elapsed_text.set(f"已运行：{self._format_seconds(elapsed)}")
+        if self.running:
+            self._timer_after_id = self.root.after(1000, self._update_elapsed_timer)
+
+    def _stop_elapsed_timer(self) -> str:
+        """Freeze and return the exact elapsed time shown in completion dialogs."""
+        elapsed = 0.0
+        if self._task_started_at is not None:
+            elapsed = time.monotonic() - self._task_started_at
+            self._task_started_at = None
+        if self._timer_after_id is not None:
+            self.root.after_cancel(self._timer_after_id)
+            self._timer_after_id = None
+        formatted = self._format_seconds(elapsed)
+        self.elapsed_text.set(f"运行耗时：{formatted}")
+        return formatted
 
     def _finish_progress(self) -> None:
         """Complete the current bar even when the source command lacks final detail."""

@@ -24,6 +24,11 @@ def main() -> None:
         default="performance",
         help="CPU 模式：performance 使用更多线程；balanced 为 GUI 流畅预留核心",
     )
+    parser.add_argument(
+        "--gpu-acceleration",
+        action="store_true",
+        help="启用 NVIDIA CUDA 高性能模式（FP16/TF32）；CUDA 不可用时直接报错",
+    )
     args = parser.parse_args()
 
     if not args.video:
@@ -38,6 +43,7 @@ def main() -> None:
         merge_gap=args.merge_gap,
         duplicate_threshold=args.duplicate_threshold,
         cpu_thread_profile=args.cpu_thread_profile,
+        gpu_acceleration=args.gpu_acceleration,
     )
     print(f"\n完成，合并字幕：{outputs.merged}")
 

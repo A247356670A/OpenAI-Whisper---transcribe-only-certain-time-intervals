@@ -70,6 +70,12 @@ python openai_whisper_transcribe_only_certain_time_intervals.py
 
 “转写性能”默认是“平衡（界面优先）”，在 macOS 上会保留更多 CPU 给界面，减少点击卡顿；选择“性能优先”会使用更多 CPU 线程来缩短识别时间，但处理期间界面可能稍有迟滞。Windows 保持原有线程策略。终端运行默认使用性能优先，也可以用 `--cpu-thread-profile balanced` 改为平衡模式。
 
+### GPU 高性能模式
+
+处理设置中新增“GPU 高性能模式（NVIDIA CUDA）”，默认关闭，只作用于字幕 A、字幕 B 和完整 A+B 的 Whisper 识别，不影响字幕拆分、合并、清理、烧录或下载功能。关闭时保持原有设备选择逻辑；开启后会要求 CUDA 可用，并启用 FP16、TF32 和 cuDNN 高性能设置。运行日志会显示实际使用的显卡名称和 `GPU 高性能模式已启用`。
+
+该模式需要 NVIDIA 显卡、兼容驱动以及 CUDA 版 PyTorch。Windows + Python 3.12 的依赖同时安装与 PyTorch 匹配的 `triton-windows`，用于加速 `word_timestamps=True` 所需的 median/DTW 时间轴内核；该轮子自带最小 CUDA 工具链，不要求另外安装完整 CUDA Toolkit。若当前环境只有 CPU 版 PyTorch，程序会在加载模型前给出错误说明，不会静默退回 CPU。命令行也可使用 `--gpu-acceleration` 开启。
+
 ### 仅生成字幕 A
 
 选择 GUI 中的“仅生成字幕 A”模式并提供原视频。程序只执行完整视频的第一轮日语识别，输出 `视频名_A.srt`，不会生成 B 或合并字幕。

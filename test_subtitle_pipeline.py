@@ -108,6 +108,55 @@ class SubtitlePipelineTests(unittest.TestCase):
         self.assertEqual(mac_performance_torch.thread_count, 9)
         self.assertEqual(windows_torch.thread_count, 9)
 
+    def test_gpu_high_performance_mode_requires_cuda(self):
+        logs = []
+        with self.assertRaisesRegex(RuntimeError, "NVIDIA CUDA"):
+            subtitle_pipeline._configure_whisper_device(
+                _FakeTorch,
+                gpu_acceleration=True,
+                log_callback=logs.append,
+            )
+        self.assertEqual(logs, [])
+
+    def test_gpu_high_performance_mode_enables_fast_paths(self):
+        class _Flag:
+            pass
+
+        class _Cuda:
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def get_device_name(_index):
+                return "Test GPU"
+
+        class _Torch:
+            cuda = _Cuda()
+            backends = _Flag()
+            backends.cuda = _Flag()
+            backends.cuda.matmul = _Flag()
+            backends.cudnn = _Flag()
+            precision = None
+
+            @classmethod
+            def set_float32_matmul_precision(cls, value):
+                cls.precision = value
+
+        logs = []
+        device = subtitle_pipeline._configure_whisper_device(
+            _Torch,
+            gpu_acceleration=True,
+            log_callback=logs.append,
+        )
+
+        self.assertEqual(device, "cuda")
+        self.assertTrue(_Torch.backends.cuda.matmul.allow_tf32)
+        self.assertTrue(_Torch.backends.cudnn.allow_tf32)
+        self.assertTrue(_Torch.backends.cudnn.benchmark)
+        self.assertEqual(_Torch.precision, "high")
+        self.assertIn("Test GPU", logs[0])
+
     def test_whisper_options_are_converted_from_gui_values(self):
         values = default_option_values("second")
         values.update(

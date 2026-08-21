@@ -303,6 +303,64 @@ def _reserve_cpu_for_gui(torch: Any, profile: str = "balanced") -> int | None:
     return worker_threads
 
 
+def _configure_whisper_device(
+    torch: Any,
+    *,
+    gpu_acceleration: bool = False,
+    log_callback: LogCallback | None = None,
+) -> str:
+    """Select Whisper's device and optionally enable CUDA fast-path settings.
+
+    With the option disabled this deliberately preserves the previous device
+    selection logic: CUDA is used when the installed Torch build exposes it,
+    otherwise CPU is used.  The opt-in mode requires CUDA and never silently
+    falls back to CPU, so the user can tell whether acceleration is active.
+    """
+    cuda_available = bool(torch.cuda.is_available())
+    if gpu_acceleration and not cuda_available:
+        torch_cuda_version = getattr(getattr(torch, "version", None), "cuda", None)
+        detail = (
+            "当前 PyTorch 是 CPU 版本。"
+            if not torch_cuda_version
+            else f"PyTorch CUDA {torch_cuda_version} 未检测到可用显卡。"
+        )
+        raise RuntimeError(
+            "无法启用 GPU 高性能模式：未检测到可用的 NVIDIA CUDA。\n"
+            f"{detail}\n请安装与显卡驱动匹配的 CUDA 版 PyTorch，或取消该选项。"
+        )
+
+    device = "cuda" if cuda_available else "cpu"
+    if not gpu_acceleration:
+        return device
+
+    # These settings affect only the explicitly selected high-performance
+    # mode.  They improve throughput on recent NVIDIA GPUs without changing
+    # file splitting, timestamps, merging, or any non-Whisper feature.
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except (AttributeError, RuntimeError):
+        pass
+
+    try:
+        gpu_name = torch.cuda.get_device_name(0)
+    except (AttributeError, RuntimeError):
+        gpu_name = "NVIDIA CUDA GPU"
+    _log(
+        log_callback,
+        f"GPU 高性能模式已启用：{gpu_name}；Whisper 使用 CUDA、FP16、TF32。",
+    )
+    return device
+
+
 def _probe_media_duration(path: Path) -> float | None:
     """Read media duration via ffprobe when available for an A-pass progress bar."""
     ffprobe = _find_ffprobe()
@@ -483,6 +541,7 @@ def run_two_pass_transcription(
     b_speech_only: bool = False,
     b_vad_aggressiveness: int = 2,
     cpu_thread_profile: str = "balanced",
+    gpu_acceleration: bool = False,
     first_whisper_values: Mapping[str, Any] | None = None,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
@@ -517,7 +576,9 @@ def run_two_pass_transcription(
     _progress(progress_callback, "subtitle_a", 0, a_duration or 0)
 
     librosa, torch, whisper = _import_dependencies()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _configure_whisper_device(
+        torch, gpu_acceleration=gpu_acceleration, log_callback=log_callback
+    )
     if device == "cpu":
         worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
         if worker_threads:
@@ -532,6 +593,9 @@ def run_two_pass_transcription(
     second_options = build_whisper_options(
         "second", second_whisper_values, device=device
     )
+    if gpu_acceleration:
+        first_options["fp16"] = True
+        second_options["fp16"] = True
 
     _log(log_callback, "第 1 步/3：识别完整视频，生成字幕 A…")
     transcribe(str(source), first_options, model, str(outputs.first_pass))
@@ -612,6 +676,7 @@ def run_first_pass_transcription(
     *,
     model_name: str = "large-v2",
     cpu_thread_profile: str = "balanced",
+    gpu_acceleration: bool = False,
     first_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -636,7 +701,9 @@ def run_first_pass_transcription(
     _progress(progress_callback, "subtitle_a", 0, a_duration or 0)
 
     _librosa, torch, whisper = _import_dependencies()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _configure_whisper_device(
+        torch, gpu_acceleration=gpu_acceleration, log_callback=log_callback
+    )
     if device == "cpu":
         worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
         if worker_threads:
@@ -646,6 +713,8 @@ def run_first_pass_transcription(
     first_options = build_whisper_options(
         "first", first_whisper_values, device=device
     )
+    if gpu_acceleration:
+        first_options["fp16"] = True
 
     _log(log_callback, "仅生成 A：正在识别完整视频…")
     transcribe(str(source), first_options, model, str(first_pass))
@@ -668,6 +737,7 @@ def run_second_pass_from_subtitle(
     b_speech_only: bool = False,
     b_vad_aggressiveness: int = 2,
     cpu_thread_profile: str = "balanced",
+    gpu_acceleration: bool = False,
     second_whisper_values: Mapping[str, Any] | None = None,
     log_callback: LogCallback | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -702,7 +772,9 @@ def run_second_pass_from_subtitle(
         )
 
     librosa, torch, whisper = _import_dependencies()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = _configure_whisper_device(
+        torch, gpu_acceleration=gpu_acceleration, log_callback=log_callback
+    )
     if device == "cpu":
         worker_threads = _reserve_cpu_for_gui(torch, cpu_thread_profile)
         if worker_threads:
@@ -712,6 +784,8 @@ def run_second_pass_from_subtitle(
     second_options = build_whisper_options(
         "second", second_whisper_values, device=device
     )
+    if gpu_acceleration:
+        second_options["fp16"] = True
 
     _log(log_callback, "正在读取视频，并按已有字幕 A 的时间轴寻找未覆盖片段…")
     audio_array, sample_rate = librosa.load(str(source), sr=16_000, mono=True)
