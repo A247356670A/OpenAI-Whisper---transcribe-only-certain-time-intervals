@@ -1477,13 +1477,15 @@ class SubtitleApp:
 
         self.preview_frame = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
         self.preview_frame.pack(fill="x", pady=(6, 7))
-        ttk.Label(
+        self.output_preview_label = ttk.Label(
             self.preview_frame,
             textvariable=self.output_preview,
             justify="left",
             style="Hint.TLabel",
-            wraplength=850,
-        ).pack(anchor="w")
+            wraplength=1400,
+        )
+        self.output_preview_label.pack(fill="x", anchor="w")
+        self.preview_frame.bind("<Configure>", self._resize_output_preview_wrap)
 
         button_row = ttk.Frame(self.root)
         button_row.pack(fill="x", pady=(0, 7))
@@ -1548,6 +1550,12 @@ class SubtitleApp:
         WhisperOptionsDialog(
             self.root, self.first_whisper_values, self.second_whisper_values
         )
+
+    def _resize_output_preview_wrap(self, event) -> None:
+        """Use the full preview row width while retaining small-window wrapping."""
+        wraplength = max(320, int(event.width) - 28)
+        if int(float(self.output_preview_label.cget("wraplength"))) != wraplength:
+            self.output_preview_label.configure(wraplength=wraplength)
 
     def _on_mode_changed(self) -> None:
         mode = self.run_mode.get()

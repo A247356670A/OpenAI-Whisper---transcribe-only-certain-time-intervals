@@ -57,6 +57,26 @@ class _FakeLibrosa:
 
 
 class SubtitlePipelineTests(unittest.TestCase):
+    def test_output_preview_wrap_uses_available_horizontal_space(self):
+        class _FakeLabel:
+            value = 850
+
+            @classmethod
+            def cget(cls, _key):
+                return cls.value
+
+            @classmethod
+            def configure(cls, *, wraplength):
+                cls.value = wraplength
+
+        app = object.__new__(subtitle_gui.SubtitleApp)
+        app.output_preview_label = _FakeLabel()
+
+        app._resize_output_preview_wrap(types.SimpleNamespace(width=1500))
+        self.assertEqual(_FakeLabel.value, 1472)
+        app._resize_output_preview_wrap(types.SimpleNamespace(width=200))
+        self.assertEqual(_FakeLabel.value, 320)
+
     def test_window_geometry_is_capped_to_available_screen_space(self):
         class _FakeWindow:
             geometry_value = ""
