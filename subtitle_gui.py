@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import json
+import math
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -51,6 +52,7 @@ from resumable_transcription import (
 from whisper_options import (
     WHISPER_OPTION_HELP,
     WHISPER_OPTION_SPECS,
+    build_whisper_options,
     default_option_values,
 )
 
@@ -70,6 +72,8 @@ IS_MACOS = sys.platform == "darwin"
 
 APP_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_settings.json"
 APP_SETTINGS_VERSION = 3
+PARAMETER_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_parameters.json"
+PARAMETER_SETTINGS_VERSION = 1
 BUILTIN_NOTIFICATION_PATH = (
     Path(__file__).resolve().parent / "assets" / "completion_notification.wav"
 )
@@ -110,6 +114,31 @@ DOWNLOAD_COOKIE_BROWSER_LABELS = {
     "Brave（已登录 YouTube）": "brave",
     "Safari（已登录 YouTube）": "safari",
 }
+
+MODEL_CHOICES = ("tiny", "base", "small", "medium", "large-v2", "large-v3")
+
+
+def default_parameter_settings() -> dict[str, object]:
+    """Return a fresh copy of every reusable processing parameter default."""
+    return {
+        "settings_version": PARAMETER_SETTINGS_VERSION,
+        "download_cookie_browser": "不使用浏览器 Cookie",
+        "model_name": "large-v2",
+        "gpu_acceleration": False,
+        "merge_gap": "1.0",
+        "duplicate_threshold": "0.5",
+        "filter_b_speech": False,
+        "b_silero_threshold": "0.4",
+        "b_silero_min_speech_seconds": "0.10",
+        "b_silero_min_speech_ratio_percent": "0",
+        "burn_font_name": "微软雅黑",
+        "burn_font_color": "白色",
+        "burn_font_size": "16",
+        "burn_outline_size": "0.8",
+        "burn_margin_v": "10",
+        "first_whisper_values": default_option_values("first"),
+        "second_whisper_values": default_option_values("second"),
+    }
 
 
 MAIN_PARAMETER_HELP = {
@@ -351,6 +380,106 @@ def load_app_settings(path: Path = APP_SETTINGS_PATH) -> dict[str, object]:
 def save_app_settings(settings: dict[str, object], path: Path = APP_SETTINGS_PATH) -> None:
     """Persist only known preferences so future versions can evolve safely."""
     payload = {key: settings.get(key, default) for key, default in DEFAULT_APP_SETTINGS.items()}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_parameter_settings(
+    path: Path = PARAMETER_SETTINGS_PATH,
+) -> dict[str, object]:
+    """Load explicitly saved processing parameters, falling back safely by field."""
+    defaults = default_parameter_settings()
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    if not isinstance(loaded, dict):
+        return defaults
+
+    settings = defaults.copy()
+    string_keys = (
+        "download_cookie_browser",
+        "model_name",
+        "merge_gap",
+        "duplicate_threshold",
+        "b_silero_threshold",
+        "b_silero_min_speech_seconds",
+        "b_silero_min_speech_ratio_percent",
+        "burn_font_name",
+        "burn_font_color",
+        "burn_font_size",
+        "burn_outline_size",
+        "burn_margin_v",
+    )
+    for key in string_keys:
+        value = loaded.get(key)
+        if isinstance(value, str):
+            settings[key] = value
+    for key in ("gpu_acceleration", "filter_b_speech"):
+        value = loaded.get(key)
+        if isinstance(value, bool):
+            settings[key] = value
+
+    for pass_name, key in (
+        ("first", "first_whisper_values"),
+        ("second", "second_whisper_values"),
+    ):
+        saved_values = loaded.get(key)
+        pass_defaults = default_option_values(pass_name)
+        if isinstance(saved_values, dict):
+            candidate = {
+                option_key: saved_values.get(option_key, default)
+                for option_key, default in pass_defaults.items()
+            }
+            if all(isinstance(value, str) for value in candidate.values()):
+                try:
+                    build_whisper_options(pass_name, candidate, device="cpu")
+                except (TypeError, ValueError):
+                    pass
+                else:
+                    settings[key] = candidate
+
+    if settings["download_cookie_browser"] not in DOWNLOAD_COOKIE_BROWSER_LABELS:
+        settings["download_cookie_browser"] = defaults["download_cookie_browser"]
+    if settings["model_name"] not in MODEL_CHOICES:
+        settings["model_name"] = defaults["model_name"]
+    if settings["burn_font_color"] not in SUBTITLE_COLOR_CHOICES:
+        settings["burn_font_color"] = defaults["burn_font_color"]
+
+    numeric_rules = {
+        "merge_gap": lambda value: value >= 0,
+        "duplicate_threshold": lambda value: value >= 0,
+        "b_silero_threshold": lambda value: 0 <= value <= 1,
+        "b_silero_min_speech_seconds": lambda value: value >= 0,
+        "b_silero_min_speech_ratio_percent": lambda value: 0 <= value <= 100,
+        "burn_font_size": lambda value: 12 <= value <= 160 and value.is_integer(),
+        "burn_outline_size": lambda value: 0 <= value <= 12,
+        "burn_margin_v": lambda value: 0 <= value <= 1000 and value.is_integer(),
+    }
+    for key, is_valid in numeric_rules.items():
+        try:
+            numeric_value = float(str(settings[key]).strip())
+        except ValueError:
+            settings[key] = defaults[key]
+            continue
+        if not math.isfinite(numeric_value) or not is_valid(numeric_value):
+            settings[key] = defaults[key]
+
+    font_name = str(settings["burn_font_name"]).strip()
+    if not font_name or any(character in font_name for character in "',:"):
+        settings["burn_font_name"] = defaults["burn_font_name"]
+    settings["settings_version"] = PARAMETER_SETTINGS_VERSION
+    return settings
+
+
+def save_parameter_settings(
+    settings: dict[str, object],
+    path: Path = PARAMETER_SETTINGS_PATH,
+) -> None:
+    """Persist only reusable processing parameters, never input/output paths."""
+    defaults = default_parameter_settings()
+    payload = {key: settings.get(key, default) for key, default in defaults.items()}
+    payload["settings_version"] = PARAMETER_SETTINGS_VERSION
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -915,6 +1044,7 @@ class SubtitleApp:
         self.root.configure(padx=18, pady=14)
 
         saved_settings = load_app_settings()
+        saved_parameters = load_parameter_settings()
         self.events: Queue[tuple[str, object]] = Queue()
         self.running = False
         self.resumable_running = False
@@ -930,7 +1060,7 @@ class SubtitleApp:
         self.subtitle_b_path = tk.StringVar()
         self.download_link = tk.StringVar()
         self.download_cookie_browser = tk.StringVar(
-            value="不使用浏览器 Cookie"
+            value=str(saved_parameters["download_cookie_browser"])
         )
         self.notification_enabled = tk.BooleanVar(
             value=bool(saved_settings["notification_enabled"])
@@ -949,21 +1079,43 @@ class SubtitleApp:
         )
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
-        self.model_name = tk.StringVar(value="large-v2")
-        self.gpu_acceleration = tk.BooleanVar(value=False)
-        self.merge_gap = tk.StringVar(value="1.0")
-        self.duplicate_threshold = tk.StringVar(value="0.5")
+        self.model_name = tk.StringVar(value=str(saved_parameters["model_name"]))
+        self.gpu_acceleration = tk.BooleanVar(
+            value=bool(saved_parameters["gpu_acceleration"])
+        )
+        self.merge_gap = tk.StringVar(value=str(saved_parameters["merge_gap"]))
+        self.duplicate_threshold = tk.StringVar(
+            value=str(saved_parameters["duplicate_threshold"])
+        )
         # Opt-in only: unchecked retains every reverse-cut B gap.  Silero
         # replaces the former RMS and WebRTC filters with one speech model.
-        self.filter_b_speech = tk.BooleanVar(value=False)
-        self.b_silero_threshold = tk.StringVar(value="0.4")
-        self.b_silero_min_speech_seconds = tk.StringVar(value="0.10")
-        self.b_silero_min_speech_ratio_percent = tk.StringVar(value="0")
-        self.burn_font_name = tk.StringVar(value="微软雅黑")
-        self.burn_font_color = tk.StringVar(value="白色")
-        self.burn_font_size = tk.StringVar(value="16")
-        self.burn_outline_size = tk.StringVar(value="0.8")
-        self.burn_margin_v = tk.StringVar(value="10")
+        self.filter_b_speech = tk.BooleanVar(
+            value=bool(saved_parameters["filter_b_speech"])
+        )
+        self.b_silero_threshold = tk.StringVar(
+            value=str(saved_parameters["b_silero_threshold"])
+        )
+        self.b_silero_min_speech_seconds = tk.StringVar(
+            value=str(saved_parameters["b_silero_min_speech_seconds"])
+        )
+        self.b_silero_min_speech_ratio_percent = tk.StringVar(
+            value=str(saved_parameters["b_silero_min_speech_ratio_percent"])
+        )
+        self.burn_font_name = tk.StringVar(
+            value=str(saved_parameters["burn_font_name"])
+        )
+        self.burn_font_color = tk.StringVar(
+            value=str(saved_parameters["burn_font_color"])
+        )
+        self.burn_font_size = tk.StringVar(
+            value=str(saved_parameters["burn_font_size"])
+        )
+        self.burn_outline_size = tk.StringVar(
+            value=str(saved_parameters["burn_outline_size"])
+        )
+        self.burn_margin_v = tk.StringVar(
+            value=str(saved_parameters["burn_margin_v"])
+        )
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="等待开始。")
@@ -974,11 +1126,11 @@ class SubtitleApp:
         self._timer_after_id: str | None = None
         self.first_whisper_values = {
             key: tk.StringVar(value=value)
-            for key, value in default_option_values("first").items()
+            for key, value in dict(saved_parameters["first_whisper_values"]).items()
         }
         self.second_whisper_values = {
             key: tk.StringVar(value=value)
-            for key, value in default_option_values("second").items()
+            for key, value in dict(saved_parameters["second_whisper_values"]).items()
         }
 
         self._configure_style()
@@ -1103,6 +1255,105 @@ class SubtitleApp:
         except OSError as exc:
             self._append_log(f"无法保存应用设置：{exc}")
         self.status.set("应用设置已保存。")
+
+    def _current_parameter_settings(self) -> dict[str, object]:
+        """Collect reusable controls while deliberately excluding file paths."""
+        return {
+            "settings_version": PARAMETER_SETTINGS_VERSION,
+            "download_cookie_browser": self.download_cookie_browser.get(),
+            "model_name": self.model_name.get(),
+            "gpu_acceleration": self.gpu_acceleration.get(),
+            "merge_gap": self.merge_gap.get(),
+            "duplicate_threshold": self.duplicate_threshold.get(),
+            "filter_b_speech": self.filter_b_speech.get(),
+            "b_silero_threshold": self.b_silero_threshold.get(),
+            "b_silero_min_speech_seconds": self.b_silero_min_speech_seconds.get(),
+            "b_silero_min_speech_ratio_percent": (
+                self.b_silero_min_speech_ratio_percent.get()
+            ),
+            "burn_font_name": self.burn_font_name.get(),
+            "burn_font_color": self.burn_font_color.get(),
+            "burn_font_size": self.burn_font_size.get(),
+            "burn_outline_size": self.burn_outline_size.get(),
+            "burn_margin_v": self.burn_margin_v.get(),
+            "first_whisper_values": self._snapshot_whisper_values(
+                self.first_whisper_values
+            ),
+            "second_whisper_values": self._snapshot_whisper_values(
+                self.second_whisper_values
+            ),
+        }
+
+    def _validate_parameters_for_saving(self) -> None:
+        """Reject invalid visible values instead of persisting a broken startup state."""
+        try:
+            merge_gap = float(self.merge_gap.get())
+            duplicate_threshold = float(self.duplicate_threshold.get())
+            threshold = float(self.b_silero_threshold.get())
+            min_speech_seconds = float(self.b_silero_min_speech_seconds.get())
+            ratio_percent = float(self.b_silero_min_speech_ratio_percent.get())
+        except ValueError as exc:
+            raise ValueError("合并、去重和 Silero 参数都必须是数字。") from exc
+        numeric_values = (
+            merge_gap,
+            duplicate_threshold,
+            threshold,
+            min_speech_seconds,
+            ratio_percent,
+        )
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError("参数不能使用 NaN 或无穷大。")
+        if merge_gap < 0 or duplicate_threshold < 0:
+            raise ValueError("合并间隔和去重阈值必须大于或等于 0。")
+        if not 0 <= threshold <= 1:
+            raise ValueError("人声概率阈值必须在 0 到 1 之间。")
+        if min_speech_seconds < 0:
+            raise ValueError("最短累计人声不能小于 0 秒。")
+        if not 0 <= ratio_percent <= 100:
+            raise ValueError("最小人声占比必须在 0% 到 100% 之间。")
+        self._get_burn_style_values()
+        first_values = self._snapshot_whisper_values(self.first_whisper_values)
+        second_values = self._snapshot_whisper_values(self.second_whisper_values)
+        build_whisper_options("first", first_values, device="cpu")
+        build_whisper_options("second", second_values, device="cpu")
+
+    def _save_parameters_for_next_launch(self) -> None:
+        try:
+            self._validate_parameters_for_saving()
+            save_parameter_settings(self._current_parameter_settings())
+        except ValueError as exc:
+            messagebox.showwarning("参数无法保存", str(exc))
+            return
+        except OSError as exc:
+            messagebox.showerror("保存失败", f"无法保存参数：{exc}")
+            return
+        self.status.set("当前参数已保存，下次启动时会自动加载。")
+
+    def _restore_default_parameters(self) -> None:
+        defaults = default_parameter_settings()
+        self.download_cookie_browser.set(str(defaults["download_cookie_browser"]))
+        self.model_name.set(str(defaults["model_name"]))
+        self.gpu_acceleration.set(bool(defaults["gpu_acceleration"]))
+        self.merge_gap.set(str(defaults["merge_gap"]))
+        self.duplicate_threshold.set(str(defaults["duplicate_threshold"]))
+        self.filter_b_speech.set(bool(defaults["filter_b_speech"]))
+        self.b_silero_threshold.set(str(defaults["b_silero_threshold"]))
+        self.b_silero_min_speech_seconds.set(
+            str(defaults["b_silero_min_speech_seconds"])
+        )
+        self.b_silero_min_speech_ratio_percent.set(
+            str(defaults["b_silero_min_speech_ratio_percent"])
+        )
+        self.burn_font_name.set(str(defaults["burn_font_name"]))
+        self.burn_font_color.set(str(defaults["burn_font_color"]))
+        self.burn_font_size.set(str(defaults["burn_font_size"]))
+        self.burn_outline_size.set(str(defaults["burn_outline_size"]))
+        self.burn_margin_v.set(str(defaults["burn_margin_v"]))
+        for key, value in dict(defaults["first_whisper_values"]).items():
+            self.first_whisper_values[key].set(value)
+        for key, value in dict(defaults["second_whisper_values"]).items():
+            self.second_whisper_values[key].set(value)
+        self.status.set("参数已恢复为默认值；点击“保存当前参数”可用于下次启动。")
 
     def _play_notification_sound(self, sound: str, sound_path: str) -> None:
         """Play a short, non-blocking completion notification on the UI thread."""
@@ -1328,7 +1579,7 @@ class SubtitleApp:
             options,
             state="readonly",
             textvariable=self.model_name,
-            values=("tiny", "base", "small", "medium", "large-v2", "large-v3"),
+            values=MODEL_CHOICES,
             width=14,
         )
         self.model_box.grid(row=0, column=1, sticky="w", padx=(8, 20))
@@ -1410,6 +1661,20 @@ class SubtitleApp:
             style="Hint.TLabel",
             wraplength=820,
         ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(5, 0))
+        parameter_actions = ttk.Frame(options)
+        parameter_actions.grid(
+            row=5, column=0, columnspan=6, sticky="e", pady=(9, 0)
+        )
+        ttk.Button(
+            parameter_actions,
+            text="恢复默认参数",
+            command=self._restore_default_parameters,
+        ).pack(side="right")
+        ttk.Button(
+            parameter_actions,
+            text="保存当前参数（下次启动使用）",
+            command=self._save_parameters_for_next_launch,
+        ).pack(side="right", padx=(0, 8))
 
         self.burn_style_frame = ttk.LabelFrame(
             self.root, text="烧录字幕样式", padding=(10, 7)

@@ -152,6 +152,51 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(sound_migrated["ui_font_size"], 12)
             self.assertEqual(sound_migrated["notification_sound"], "内置提示音")
 
+    def test_processing_parameters_round_trip_and_invalid_fields_use_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            settings_path = Path(temporary_directory) / "parameters.json"
+            parameters = subtitle_gui.default_parameter_settings()
+            parameters.update(
+                {
+                    "download_cookie_browser": "Edge（已登录 YouTube）",
+                    "model_name": "small",
+                    "gpu_acceleration": True,
+                    "merge_gap": "0.25",
+                    "filter_b_speech": True,
+                    "burn_font_size": "28",
+                    "unknown_future_parameter": "ignored",
+                }
+            )
+            first_values = dict(parameters["first_whisper_values"])
+            first_values["initial_prompt"] = "角色名"
+            parameters["first_whisper_values"] = first_values
+
+            subtitle_gui.save_parameter_settings(parameters, settings_path)
+            loaded = subtitle_gui.load_parameter_settings(settings_path)
+
+            self.assertEqual(loaded["model_name"], "small")
+            self.assertTrue(loaded["gpu_acceleration"])
+            self.assertEqual(loaded["merge_gap"], "0.25")
+            self.assertEqual(loaded["burn_font_size"], "28")
+            self.assertEqual(
+                loaded["first_whisper_values"]["initial_prompt"], "角色名"
+            )
+            self.assertNotIn("unknown_future_parameter", loaded)
+
+            settings_path.write_text(
+                '{"model_name": "invalid", "merge_gap": "-2", '
+                '"burn_font_size": "huge", "first_whisper_values": []}',
+                encoding="utf-8",
+            )
+            recovered = subtitle_gui.load_parameter_settings(settings_path)
+            defaults = subtitle_gui.default_parameter_settings()
+            self.assertEqual(recovered["model_name"], defaults["model_name"])
+            self.assertEqual(recovered["merge_gap"], defaults["merge_gap"])
+            self.assertEqual(recovered["burn_font_size"], defaults["burn_font_size"])
+            self.assertEqual(
+                recovered["first_whisper_values"], defaults["first_whisper_values"]
+            )
+
     def test_bundled_completion_sound_is_available(self):
         self.assertEqual(
             subtitle_gui.DEFAULT_APP_SETTINGS["notification_sound"], "内置提示音"
