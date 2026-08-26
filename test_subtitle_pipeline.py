@@ -163,6 +163,8 @@ class SubtitlePipelineTests(unittest.TestCase):
                     "gpu_acceleration": True,
                     "merge_gap": "0.25",
                     "filter_b_speech": True,
+                    "burn_font_color": "#12AB34",
+                    "burn_outline_color": "#445566",
                     "burn_font_size": "28",
                     "unknown_future_parameter": "ignored",
                 }
@@ -177,6 +179,8 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(loaded["model_name"], "small")
             self.assertTrue(loaded["gpu_acceleration"])
             self.assertEqual(loaded["merge_gap"], "0.25")
+            self.assertEqual(loaded["burn_font_color"], "#12AB34")
+            self.assertEqual(loaded["burn_outline_color"], "#445566")
             self.assertEqual(loaded["burn_font_size"], "28")
             self.assertEqual(
                 loaded["first_whisper_values"]["initial_prompt"], "角色名"
@@ -185,6 +189,7 @@ class SubtitlePipelineTests(unittest.TestCase):
 
             settings_path.write_text(
                 '{"model_name": "invalid", "merge_gap": "-2", '
+                '"burn_font_color": "透明", "burn_outline_color": "#ABCDE", '
                 '"burn_font_size": "huge", "first_whisper_values": []}',
                 encoding="utf-8",
             )
@@ -192,10 +197,58 @@ class SubtitlePipelineTests(unittest.TestCase):
             defaults = subtitle_gui.default_parameter_settings()
             self.assertEqual(recovered["model_name"], defaults["model_name"])
             self.assertEqual(recovered["merge_gap"], defaults["merge_gap"])
+            self.assertEqual(recovered["burn_font_color"], defaults["burn_font_color"])
+            self.assertEqual(
+                recovered["burn_outline_color"], defaults["burn_outline_color"]
+            )
             self.assertEqual(recovered["burn_font_size"], defaults["burn_font_size"])
             self.assertEqual(
                 recovered["first_whisper_values"], defaults["first_whisper_values"]
             )
+
+    def test_subtitle_colours_accept_named_and_rgb_values(self):
+        self.assertEqual(subtitle_pipeline.subtitle_color_to_ass("白色"), "&H00FFFFFF")
+        self.assertEqual(
+            subtitle_pipeline.subtitle_color_to_ass("#112233"), "&H00332211"
+        )
+        self.assertEqual(subtitle_pipeline.subtitle_color_to_hex("青色"), "#00FFFF")
+        self.assertEqual(subtitle_pipeline.subtitle_color_to_hex("a1b2c3"), "#A1B2C3")
+        with self.assertRaises(ValueError):
+            subtitle_pipeline.subtitle_color_to_ass("透明")
+
+    def test_subtitle_style_presets_round_trip_and_skip_invalid_entries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            preset_path = Path(temporary_directory) / "styles.json"
+            subtitle_gui.save_subtitle_style_presets(
+                {
+                    "直播通用": {
+                        "font_name": "微软雅黑",
+                        "font_color": "#f0f0f0",
+                        "font_size": "16",
+                        "outline_color": "#102030",
+                        "outline_size": "0.8",
+                        "margin_v": "10",
+                    }
+                },
+                preset_path,
+            )
+
+            loaded = subtitle_gui.load_subtitle_style_presets(preset_path)
+            self.assertEqual(loaded["直播通用"]["font_color"], "#F0F0F0")
+            self.assertEqual(loaded["直播通用"]["outline_color"], "#102030")
+            self.assertEqual(loaded["直播通用"]["outline_size"], "0.8")
+            self.assertNotIn("video_path", preset_path.read_text(encoding="utf-8"))
+
+            preset_path.write_text(
+                '{"presets": {"有效": {"font_name": "Meiryo", '
+                '"font_color": "白色", "font_size": "18", '
+                '"outline_color": "黑色", "outline_size": "1", '
+                '"margin_v": "20"}, "损坏": {"font_name": "Meiryo", '
+                '"font_color": "不是颜色"}}}',
+                encoding="utf-8",
+            )
+            recovered = subtitle_gui.load_subtitle_style_presets(preset_path)
+            self.assertEqual(tuple(recovered), ("有效",))
 
     def test_bundled_completion_sound_is_available(self):
         self.assertEqual(
@@ -387,7 +440,8 @@ class SubtitlePipelineTests(unittest.TestCase):
                     folder,
                     font_name="Meiryo",
                     font_size=52,
-                    font_color="黄色",
+                    font_color="#12AB34",
+                    outline_color="#445566",
                     outline_size=3,
                     margin_v=72,
                 )
@@ -401,7 +455,8 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertIn("subtitles=filename=", subtitle_filter)
             self.assertIn("FontName=Meiryo", subtitle_filter)
             self.assertIn("FontSize=52", subtitle_filter)
-            self.assertIn("PrimaryColour=&H0000FFFF", subtitle_filter)
+            self.assertIn("PrimaryColour=&H0034AB12", subtitle_filter)
+            self.assertIn("OutlineColour=&H00665544", subtitle_filter)
             self.assertIn("Outline=3", subtitle_filter)
             self.assertIn("MarginV=72", subtitle_filter)
 
@@ -451,6 +506,7 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertIn("FontName=SimHei", subtitle_filter)
             self.assertIn("FontSize=50", subtitle_filter)
             self.assertIn("PrimaryColour=&H00FFFF00", subtitle_filter)
+            self.assertIn("OutlineColour=&H00000000", subtitle_filter)
             self.assertIn("MarginV=64", subtitle_filter)
 
     def test_burn_subtitles_marks_non_mp4_as_conversion_input(self):
@@ -844,6 +900,52 @@ class SubtitlePipelineTests(unittest.TestCase):
                 output.chinese_only.read_text(encoding="utf-8"),
                 "1\n00:00:00,000 --> 00:00:02,000\n中文第一行\n\n"
                 "2\n00:00:03,000 --> 00:00:04,000\n第二句中文\n",
+            )
+
+    def test_reorder_bilingual_subtitles_normalizes_detectable_entries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            bilingual = folder / "mixed_order.srt"
+            bilingual.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\n今日は楽しいです\n今天很开心\n\n"
+                "2\n00:00:03,000 --> 00:00:04,000\n已经是中文在上\n日本語は下です\n\n"
+                "3\n00:00:05,000 --> 00:00:06,000\nABC 123\nDEF 456\n",
+                encoding="utf-8",
+            )
+
+            output = subtitle_pipeline.reorder_bilingual_subtitles(
+                bilingual, folder, order="chinese_first"
+            )
+
+            self.assertEqual(output.reordered_subtitle, folder / "mixed_order_ordered.srt")
+            self.assertEqual(output.processed_count, 3)
+            self.assertEqual(output.swapped_count, 1)
+            self.assertEqual(output.ambiguous_count, 1)
+            result = output.reordered_subtitle.read_text(encoding="utf-8")
+            self.assertIn("今天很开心\n今日は楽しいです", result)
+            self.assertIn("已经是中文在上\n日本語は下です", result)
+            self.assertIn("ABC 123\nDEF 456", result)
+
+    def test_reorder_bilingual_subtitles_can_force_swap_first_two_lines(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            folder = Path(temporary_directory)
+            bilingual = folder / "force.srt"
+            bilingual.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\n第一行\n第二行\n第三行\n\n"
+                "2\n00:00:03,000 --> 00:00:04,000\n单行字幕\n",
+                encoding="utf-8",
+            )
+
+            output = subtitle_pipeline.reorder_bilingual_subtitles(
+                bilingual, folder, order="swap_all"
+            )
+
+            self.assertEqual(output.processed_count, 1)
+            self.assertEqual(output.swapped_count, 1)
+            self.assertEqual(output.ambiguous_count, 0)
+            self.assertIn(
+                "第二行\n第一行\n第三行",
+                output.reordered_subtitle.read_text(encoding="utf-8"),
             )
 
     def test_resumable_workflow_cancels_at_complete_chunk_and_resumes(self):

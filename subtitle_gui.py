@@ -17,10 +17,11 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from SrtMerge import seconds_to_srt_time
 from subtitle_pipeline import (
     build_output_paths,
+    build_bilingual_order_path,
     build_chinese_only_path,
     build_burned_video_path,
     build_hallucination_cleanup_path,
@@ -36,6 +37,7 @@ from subtitle_pipeline import (
     parse_editable_srt_text,
     prepare_manual_subtitle_merge,
     prepare_hallucination_cleanup,
+    reorder_bilingual_subtitles,
     run_first_pass_transcription,
     run_second_pass_from_subtitle,
     run_two_pass_transcription,
@@ -44,6 +46,8 @@ from subtitle_pipeline import (
     B_SILERO_THRESHOLD,
     SUBTITLE_COLOR_CHOICES,
     SUBTITLE_FONT_CHOICES,
+    subtitle_color_to_ass,
+    subtitle_color_to_hex,
 )
 from resumable_transcription import (
     build_resumable_output_paths,
@@ -73,7 +77,9 @@ IS_MACOS = sys.platform == "darwin"
 APP_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_settings.json"
 APP_SETTINGS_VERSION = 3
 PARAMETER_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_parameters.json"
-PARAMETER_SETTINGS_VERSION = 1
+PARAMETER_SETTINGS_VERSION = 2
+SUBTITLE_STYLE_PRESETS_PATH = Path.home() / ".japanese_subtitle_extractor_styles.json"
+SUBTITLE_STYLE_PRESETS_VERSION = 1
 BUILTIN_NOTIFICATION_PATH = (
     Path(__file__).resolve().parent / "assets" / "completion_notification.wav"
 )
@@ -115,6 +121,19 @@ DOWNLOAD_COOKIE_BROWSER_LABELS = {
     "Safari（已登录 YouTube）": "safari",
 }
 
+BILINGUAL_ORDER_LABELS = {
+    "自动统一：中文在上、日文在下": "chinese_first",
+    "自动统一：日文在上、中文在下": "japanese_first",
+    "强制交换：每条字幕的前两行": "swap_all",
+}
+BILINGUAL_ORDER_HELP = """作用：调整中日双语 SRT 中每条字幕上下两行的顺序。
+
+自动统一会通过日语假名判断哪一行是日文，只交换顺序错误的条目。例如“今日は楽しいです”含有假名，可识别为日文；“今天很开心”会识别为中文。
+
+如果两行都含假名、都不含假名，或日文恰好全是汉字，程序无法可靠判断，会保持该条原样，并在日志中报告数量。
+
+“强制交换”不判断语言，会把每条双行字幕的第一行和第二行全部互换。单行字幕保持不变。原字幕文件永远不会修改。"""
+
 MODEL_CHOICES = ("tiny", "base", "small", "medium", "large-v2", "large-v3")
 
 
@@ -133,6 +152,7 @@ def default_parameter_settings() -> dict[str, object]:
         "b_silero_min_speech_ratio_percent": "0",
         "burn_font_name": "微软雅黑",
         "burn_font_color": "白色",
+        "burn_outline_color": "黑色",
         "burn_font_size": "16",
         "burn_outline_size": "0.8",
         "burn_margin_v": "10",
@@ -212,13 +232,20 @@ MAIN_PARAMETER_HELP = {
 例子：选择微软雅黑后预览正常，但换到另一台没有该字体的电脑时 FFmpeg 可能回退到其他字体或显示方框；此时应安装字体或改选当地存在的字体。
 
 注意：请先使用“预览字幕样式”检查日文假名、汉字和标点。""",
-    "burn_color": """作用：设置字幕文字主体颜色。描边颜色固定为黑色，以便在明暗变化的视频背景上保持可读性。
+    "burn_color": """作用：设置字幕文字主体颜色。可以选择常用颜色，也可以点击调色盘选择任意颜色。
 
 默认：白色。白色 + 黑色描边适合大多数直播画面；黄色可用于需要与视频原字幕区分的场景。
 
 例子：画面底部常有白色 UI 时，可以尝试黄色文字，或保留白色并增加描边。
 
-注意：颜色只影响新烧录的字幕，不会修改 SRT 文件内容。""",
+注意：调色盘生成 #RRGGBB 值，例如白色是 #FFFFFF。颜色只影响新烧录的字幕，不会修改 SRT 文件内容。""",
+    "burn_outline_color": """作用：设置字幕描边颜色。描边用于把文字和视频背景分离，现在可以独立于文字颜色自由选择。
+
+默认：黑色。白字配黑色描边最通用；深色文字可以配白色或浅色描边。
+
+例子：黄色字幕可继续使用黑色描边；黑色字幕可把描边改成 #FFFFFF，并将宽度设置为 1～2。
+
+注意：描边宽度为 0 时，即使选择了描边颜色也不会看到描边。""",
     "burn_size": """作用：设置 FFmpeg/ASS 字幕字号。实际视觉大小还会受到视频分辨率、字体本身和播放器缩放影响。
 
 默认：16。1080p 视频可从 16 开始；4K 视频通常需要更大；720p 视频可能需要稍小。
@@ -226,7 +253,7 @@ MAIN_PARAMETER_HELP = {
 例子：1080p 预览中文字太小，可依次试 18、20；一行字幕经常超出画面则减小到 14～15。
 
 注意：必须输入正整数，并以预览画面为准。""",
-    "burn_outline": """作用：设置字幕四周黑色描边的粗细。描边能让浅色文字在复杂背景上保持清晰。
+    "burn_outline": """作用：设置字幕四周描边的粗细。描边能让文字在复杂背景上保持清晰。
 
 默认：0.8。数值越大边缘越粗、可读性越强，但过大会让小字号显得拥挤。
 
@@ -240,6 +267,13 @@ MAIN_PARAMETER_HELP = {
 例子：视频底部有游戏 UI 或主播名牌遮挡字幕，可把 10 改成 40、60，再刷新预览；希望更贴近底边则减小。
 
 注意：不同分辨率视觉距离会不同，应使用当前目标视频生成预览。""",
+    "burn_preset": """作用：把当前完整字幕样式保存为一个名称，之后可以一键恢复。预设包含字体、字号、文字颜色、描边颜色、描边宽度和距底部位置。
+
+例子：把白字黑边保存为“直播通用”，把黄字深蓝描边保存为“游戏画面”，下次烧录时从列表选择并点击加载。
+
+保存：点击“保存当前”并输入名称；使用已有名称时会询问是否覆盖。删除只移除预设，不会删除字幕或视频。
+
+注意：预设保存在用户目录的 JSON 设置中，不包含视频、字幕或输出路径。""",
 }
 
 
@@ -407,6 +441,7 @@ def load_parameter_settings(
         "b_silero_min_speech_ratio_percent",
         "burn_font_name",
         "burn_font_color",
+        "burn_outline_color",
         "burn_font_size",
         "burn_outline_size",
         "burn_margin_v",
@@ -443,8 +478,11 @@ def load_parameter_settings(
         settings["download_cookie_browser"] = defaults["download_cookie_browser"]
     if settings["model_name"] not in MODEL_CHOICES:
         settings["model_name"] = defaults["model_name"]
-    if settings["burn_font_color"] not in SUBTITLE_COLOR_CHOICES:
-        settings["burn_font_color"] = defaults["burn_font_color"]
+    for color_key in ("burn_font_color", "burn_outline_color"):
+        try:
+            subtitle_color_to_ass(str(settings[color_key]))
+        except ValueError:
+            settings[color_key] = defaults[color_key]
 
     numeric_rules = {
         "merge_gap": lambda value: value >= 0,
@@ -482,6 +520,97 @@ def save_parameter_settings(
     payload["settings_version"] = PARAMETER_SETTINGS_VERSION
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+SUBTITLE_STYLE_KEYS = (
+    "font_name",
+    "font_color",
+    "font_size",
+    "outline_color",
+    "outline_size",
+    "margin_v",
+)
+
+
+def normalize_subtitle_style_preset(style: object) -> dict[str, str]:
+    """Validate and normalize one reusable burn-style preset."""
+    if not isinstance(style, dict):
+        raise ValueError("字幕样式预设格式不正确。")
+    font_name = str(style.get("font_name", "")).strip()
+    if not font_name or any(character in font_name for character in "',:"):
+        raise ValueError("预设字体名称为空或包含不支持的符号。")
+
+    def normalized_color(key: str) -> str:
+        value = str(style.get(key, "")).strip()
+        subtitle_color_to_ass(value)
+        return value if value in SUBTITLE_COLOR_CHOICES else subtitle_color_to_hex(value)
+
+    try:
+        font_size = int(str(style.get("font_size", "")).strip())
+        outline_size = float(str(style.get("outline_size", "")).strip())
+        margin_v = int(str(style.get("margin_v", "")).strip())
+    except ValueError as exc:
+        raise ValueError("预设的字号、描边宽度或字幕位置不是有效数字。") from exc
+    if not 12 <= font_size <= 160:
+        raise ValueError("预设字幕字号必须在 12 到 160 之间。")
+    if not math.isfinite(outline_size) or not 0 <= outline_size <= 12:
+        raise ValueError("预设描边宽度必须在 0 到 12 之间。")
+    if not 0 <= margin_v <= 1000:
+        raise ValueError("预设字幕位置必须在 0 到 1000 之间。")
+    return {
+        "font_name": font_name,
+        "font_color": normalized_color("font_color"),
+        "font_size": str(font_size),
+        "outline_color": normalized_color("outline_color"),
+        "outline_size": f"{outline_size:g}",
+        "margin_v": str(margin_v),
+    }
+
+
+def load_subtitle_style_presets(
+    path: Path = SUBTITLE_STYLE_PRESETS_PATH,
+) -> dict[str, dict[str, str]]:
+    """Load valid named style presets without allowing one bad entry to block all."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    raw_presets = payload.get("presets") if isinstance(payload, dict) else None
+    if not isinstance(raw_presets, dict):
+        return {}
+    presets: dict[str, dict[str, str]] = {}
+    for raw_name, raw_style in raw_presets.items():
+        name = str(raw_name).strip()
+        if not name or len(name) > 60 or any(ord(character) < 32 for character in name):
+            continue
+        try:
+            presets[name] = normalize_subtitle_style_preset(raw_style)
+        except ValueError:
+            continue
+    return dict(sorted(presets.items(), key=lambda item: item[0].casefold()))
+
+
+def save_subtitle_style_presets(
+    presets: dict[str, dict[str, str]],
+    path: Path = SUBTITLE_STYLE_PRESETS_PATH,
+) -> None:
+    """Atomically save named burn-style presets without any media paths."""
+    normalized: dict[str, dict[str, str]] = {}
+    for raw_name, style in presets.items():
+        name = str(raw_name).strip()
+        if not name or len(name) > 60 or any(ord(character) < 32 for character in name):
+            raise ValueError("预设名称必须为 1～60 个可见字符。")
+        normalized[name] = normalize_subtitle_style_preset(style)
+    payload = {
+        "settings_version": SUBTITLE_STYLE_PRESETS_VERSION,
+        "presets": dict(sorted(normalized.items(), key=lambda item: item[0].casefold())),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
 
 
 def fit_window_to_screen(
@@ -1079,6 +1208,7 @@ class SubtitleApp:
         )
         self.output_dir = tk.StringVar()
         self.run_mode = tk.StringVar(value="full")
+        self.bilingual_order = tk.StringVar(value=next(iter(BILINGUAL_ORDER_LABELS)))
         self.model_name = tk.StringVar(value=str(saved_parameters["model_name"]))
         self.gpu_acceleration = tk.BooleanVar(
             value=bool(saved_parameters["gpu_acceleration"])
@@ -1107,6 +1237,9 @@ class SubtitleApp:
         self.burn_font_color = tk.StringVar(
             value=str(saved_parameters["burn_font_color"])
         )
+        self.burn_outline_color = tk.StringVar(
+            value=str(saved_parameters["burn_outline_color"])
+        )
         self.burn_font_size = tk.StringVar(
             value=str(saved_parameters["burn_font_size"])
         )
@@ -1116,6 +1249,8 @@ class SubtitleApp:
         self.burn_margin_v = tk.StringVar(
             value=str(saved_parameters["burn_margin_v"])
         )
+        self.subtitle_style_presets = load_subtitle_style_presets()
+        self.burn_preset_name = tk.StringVar()
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
         self.progress_value = tk.DoubleVar(value=0)
         self.progress_text = tk.StringVar(value="等待开始。")
@@ -1273,6 +1408,7 @@ class SubtitleApp:
             ),
             "burn_font_name": self.burn_font_name.get(),
             "burn_font_color": self.burn_font_color.get(),
+            "burn_outline_color": self.burn_outline_color.get(),
             "burn_font_size": self.burn_font_size.get(),
             "burn_outline_size": self.burn_outline_size.get(),
             "burn_margin_v": self.burn_margin_v.get(),
@@ -1346,6 +1482,7 @@ class SubtitleApp:
         )
         self.burn_font_name.set(str(defaults["burn_font_name"]))
         self.burn_font_color.set(str(defaults["burn_font_color"]))
+        self.burn_outline_color.set(str(defaults["burn_outline_color"]))
         self.burn_font_size.set(str(defaults["burn_font_size"]))
         self.burn_outline_size.set(str(defaults["burn_outline_size"]))
         self.burn_margin_v.set(str(defaults["burn_margin_v"]))
@@ -1467,6 +1604,13 @@ class SubtitleApp:
             variable=self.run_mode,
             command=self._on_mode_changed,
         ).grid(row=3, column=1, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="统一双语字幕行序：交换中文与日文上下位置",
+            value="reorder_bilingual",
+            variable=self.run_mode,
+            command=self._on_mode_changed,
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Keep all mode-dependent inputs in one stable container.  Repacking
         # siblings of the whole window caused stale geometry and click areas
@@ -1529,6 +1673,23 @@ class SubtitleApp:
         if TkinterDnD is not None:
             self.subtitle_b_entry.drop_target_register(DND_FILES)
             self.subtitle_b_entry.dnd_bind("<<Drop>>", self._on_subtitle_b_drop)
+
+        self.bilingual_order_row = ttk.Frame(self.input_area)
+        order_label = ttk.Frame(self.bilingual_order_row)
+        order_label.pack(side="left")
+        ttk.Label(order_label, text="目标顺序", width=10).pack(side="left")
+        help_button(order_label, "双语字幕行序", BILINGUAL_ORDER_HELP).pack(
+            side="left", padx=(0, 6)
+        )
+        self.bilingual_order_box = ttk.Combobox(
+            self.bilingual_order_row,
+            state="readonly",
+            textvariable=self.bilingual_order,
+            values=tuple(BILINGUAL_ORDER_LABELS),
+            width=34,
+        )
+        self.bilingual_order_box.pack(side="left")
+        self.bilingual_order_box.bind("<<ComboboxSelected>>", lambda _event: self._update_preview())
 
         self.link_row = ttk.Frame(self.input_area)
         ttk.Label(self.link_row, text="视频链接", width=10).pack(side="left")
@@ -1694,18 +1855,16 @@ class SubtitleApp:
         self.burn_font_box.grid(row=0, column=1, sticky="w", padx=(8, 20))
         parameter_label(
             self.burn_style_frame,
-            "颜色",
+            "文字颜色",
             "烧录字幕颜色",
             MAIN_PARAMETER_HELP["burn_color"],
         ).grid(row=0, column=2, sticky="w")
-        self.burn_color_box = ttk.Combobox(
-            self.burn_style_frame,
-            state="readonly",
-            textvariable=self.burn_font_color,
-            values=tuple(SUBTITLE_COLOR_CHOICES),
-            width=10,
+        self.burn_text_color_control = self._build_color_control(
+            self.burn_style_frame, self.burn_font_color, "选择字幕文字颜色"
         )
-        self.burn_color_box.grid(row=0, column=3, sticky="w", padx=(8, 20))
+        self.burn_text_color_control.grid(
+            row=0, column=3, sticky="w", padx=(8, 20)
+        )
         parameter_label(
             self.burn_style_frame,
             "字号",
@@ -1717,27 +1876,71 @@ class SubtitleApp:
         )
         parameter_label(
             self.burn_style_frame,
-            "黑色描边",
-            "烧录字幕黑色描边",
-            MAIN_PARAMETER_HELP["burn_outline"],
+            "描边颜色",
+            "烧录字幕描边颜色",
+            MAIN_PARAMETER_HELP["burn_outline_color"],
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(self.burn_style_frame, textvariable=self.burn_outline_size, width=6).grid(
+        self.burn_outline_color_control = self._build_color_control(
+            self.burn_style_frame, self.burn_outline_color, "选择字幕描边颜色"
+        )
+        self.burn_outline_color_control.grid(
             row=1, column=1, sticky="w", padx=(8, 20), pady=(8, 0)
+        )
+        parameter_label(
+            self.burn_style_frame,
+            "描边宽度",
+            "烧录字幕描边宽度",
+            MAIN_PARAMETER_HELP["burn_outline"],
+        ).grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Entry(self.burn_style_frame, textvariable=self.burn_outline_size, width=6).grid(
+            row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0)
         )
         parameter_label(
             self.burn_style_frame,
             "距底部",
             "烧录字幕底部距离",
             MAIN_PARAMETER_HELP["burn_margin"],
-        ).grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ).grid(row=1, column=4, sticky="w", pady=(8, 0))
         ttk.Entry(self.burn_style_frame, textvariable=self.burn_margin_v, width=6).grid(
-            row=1, column=3, sticky="w", padx=(8, 20), pady=(8, 0)
+            row=1, column=5, sticky="w", padx=(8, 20), pady=(8, 0)
         )
+
+        parameter_label(
+            self.burn_style_frame,
+            "样式预设",
+            "烧录字幕样式预设",
+            MAIN_PARAMETER_HELP["burn_preset"],
+        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.burn_preset_box = ttk.Combobox(
+            self.burn_style_frame,
+            state="readonly",
+            textvariable=self.burn_preset_name,
+            values=tuple(self.subtitle_style_presets),
+            width=22,
+        )
+        self.burn_preset_box.grid(
+            row=2, column=1, sticky="w", padx=(8, 20), pady=(8, 0)
+        )
+        ttk.Button(
+            self.burn_style_frame,
+            text="保存当前",
+            command=self._save_subtitle_style_preset,
+        ).grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Button(
+            self.burn_style_frame,
+            text="加载预设",
+            command=self._load_selected_subtitle_style_preset,
+        ).grid(row=2, column=3, sticky="w", padx=(8, 20), pady=(8, 0))
+        ttk.Button(
+            self.burn_style_frame,
+            text="删除预设",
+            command=self._delete_selected_subtitle_style_preset,
+        ).grid(row=2, column=4, sticky="w", pady=(8, 0))
         self.style_preview_button = ttk.Button(
             self.burn_style_frame, text="预览字幕样式", command=self._preview_burn_style
         )
         self.style_preview_button.grid(
-            row=1, column=4, columnspan=2, sticky="w", pady=(8, 0)
+            row=2, column=5, sticky="w", padx=(8, 0), pady=(8, 0)
         )
 
         self.preview_frame = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
@@ -1869,6 +2072,14 @@ class SubtitleApp:
             self.subtitle_row.pack(fill="x", pady=(14, 7))
             self.drop_zone.configure(text="将中日双语 SRT 拖到这里\n或在下方点击“选择 SRT”")
             self.threshold_entry.configure(state="disabled")
+        elif mode == "reorder_bilingual":
+            self._show_drop_zone()
+            self.subtitle_label.configure(text="双语字幕")
+            self.subtitle_button.configure(text="选择 SRT")
+            self.subtitle_row.pack(fill="x", pady=(14, 7))
+            self.bilingual_order_row.pack(fill="x", pady=(0, 7))
+            self.drop_zone.configure(text="将中日双语 SRT 拖到这里\n或在下方点击“选择 SRT”")
+            self.threshold_entry.configure(state="disabled")
         else:
             self._show_drop_zone()
             self.video_row.pack(fill="x", pady=(14, 7))
@@ -1882,6 +2093,7 @@ class SubtitleApp:
             "merge_subtitles": "开始合并字幕",
             "hallucination_cleanup": "开始审核字幕",
             "download_mp4": "开始下载 MP4",
+            "reorder_bilingual": "开始调整字幕行序",
         }
         self.start_button.configure(text=start_labels.get(mode, "开始提取字幕"))
         self._update_preview()
@@ -1915,6 +2127,7 @@ class SubtitleApp:
             self.video_row,
             self.subtitle_row,
             self.subtitle_b_row,
+            self.bilingual_order_row,
             self.link_row,
         ):
             widget.pack_forget()
@@ -1932,7 +2145,145 @@ class SubtitleApp:
         if path:
             self._set_video(path)
 
-    def _get_burn_style_values(self) -> tuple[str, int, str, float, int]:
+    def _build_color_control(
+        self, parent: tk.Misc, variable: tk.StringVar, chooser_title: str
+    ) -> ttk.Frame:
+        """Create an editable colour field, live swatch, and palette button."""
+        frame = ttk.Frame(parent)
+        ttk.Combobox(
+            frame,
+            textvariable=variable,
+            values=tuple(SUBTITLE_COLOR_CHOICES),
+            width=9,
+        ).pack(side="left")
+        swatch = tk.Label(frame, width=3, relief="solid", borderwidth=1, cursor="hand2")
+        swatch.pack(side="left", padx=(5, 5), ipady=2)
+
+        def refresh_swatch(*_args) -> None:
+            try:
+                color = subtitle_color_to_hex(variable.get())
+            except ValueError:
+                color = "#808080"
+            swatch.configure(background=color)
+
+        def choose_color(_event=None) -> None:
+            self._choose_burn_color(variable, chooser_title)
+
+        swatch.bind("<Button-1>", choose_color)
+        ttk.Button(frame, text="调色盘…", command=choose_color).pack(side="left")
+        variable.trace_add("write", refresh_swatch)
+        refresh_swatch()
+        return frame
+
+    def _choose_burn_color(self, variable: tk.StringVar, title: str) -> None:
+        """Open the native colour palette and store a portable #RRGGBB value."""
+        try:
+            initial = subtitle_color_to_hex(variable.get())
+        except ValueError:
+            initial = "#FFFFFF"
+        _rgb, selected = colorchooser.askcolor(
+            color=initial, title=title, parent=self.root
+        )
+        if selected:
+            variable.set(selected.upper())
+
+    def _current_subtitle_style_preset(self) -> dict[str, str]:
+        """Return the current validated style in the preset storage schema."""
+        (
+            font_name,
+            font_size,
+            font_color,
+            outline_color,
+            outline_size,
+            margin_v,
+        ) = self._get_burn_style_values()
+        return normalize_subtitle_style_preset(
+            {
+                "font_name": font_name,
+                "font_color": font_color,
+                "font_size": str(font_size),
+                "outline_color": outline_color,
+                "outline_size": str(outline_size),
+                "margin_v": str(margin_v),
+            }
+        )
+
+    def _refresh_subtitle_style_preset_choices(self) -> None:
+        self.burn_preset_box.configure(values=tuple(self.subtitle_style_presets))
+
+    def _save_subtitle_style_preset(self) -> None:
+        try:
+            style = self._current_subtitle_style_preset()
+        except ValueError as exc:
+            messagebox.showwarning("样式无法保存", str(exc), parent=self.root)
+            return
+        name = simpledialog.askstring(
+            "保存字幕样式预设",
+            "请输入预设名称（例如：直播通用）：",
+            initialvalue=self.burn_preset_name.get(),
+            parent=self.root,
+        )
+        if name is None:
+            return
+        name = name.strip()
+        if not name or len(name) > 60 or any(ord(character) < 32 for character in name):
+            messagebox.showwarning(
+                "预设名称不正确", "预设名称必须为 1～60 个可见字符。", parent=self.root
+            )
+            return
+        if name in self.subtitle_style_presets and not messagebox.askyesno(
+            "覆盖预设", f"预设“{name}”已经存在，是否覆盖？", parent=self.root
+        ):
+            return
+        updated = dict(self.subtitle_style_presets)
+        updated[name] = style
+        try:
+            save_subtitle_style_presets(updated)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("保存失败", f"无法保存字幕样式预设：{exc}", parent=self.root)
+            return
+        self.subtitle_style_presets = load_subtitle_style_presets()
+        self._refresh_subtitle_style_preset_choices()
+        self.burn_preset_name.set(name)
+        self.status.set(f"字幕样式预设“{name}”已保存。")
+
+    def _load_selected_subtitle_style_preset(self) -> None:
+        name = self.burn_preset_name.get().strip()
+        style = self.subtitle_style_presets.get(name)
+        if style is None:
+            messagebox.showwarning("请选择预设", "请先从列表中选择一个字幕样式预设。")
+            return
+        self.burn_font_name.set(style["font_name"])
+        self.burn_font_color.set(style["font_color"])
+        self.burn_font_size.set(style["font_size"])
+        self.burn_outline_color.set(style["outline_color"])
+        self.burn_outline_size.set(style["outline_size"])
+        self.burn_margin_v.set(style["margin_v"])
+        self._update_preview()
+        self.status.set(f"已加载字幕样式预设“{name}”。")
+
+    def _delete_selected_subtitle_style_preset(self) -> None:
+        name = self.burn_preset_name.get().strip()
+        if name not in self.subtitle_style_presets:
+            messagebox.showwarning("请选择预设", "请先从列表中选择要删除的预设。")
+            return
+        if not messagebox.askyesno(
+            "删除预设", f"确定删除字幕样式预设“{name}”吗？", parent=self.root
+        ):
+            return
+        updated = dict(self.subtitle_style_presets)
+        del updated[name]
+        try:
+            save_subtitle_style_presets(updated)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("删除失败", f"无法更新字幕样式预设：{exc}", parent=self.root)
+            return
+        self.subtitle_style_presets = load_subtitle_style_presets()
+        self._refresh_subtitle_style_preset_choices()
+        self.burn_preset_name.set("")
+        self.status.set(f"字幕样式预设“{name}”已删除。")
+
+    def _get_burn_style_values(self) -> tuple[str, int, str, str, float, int]:
         """Read and validate the editable font controls before FFmpeg is started."""
         font_name = self.burn_font_name.get().strip()
         try:
@@ -1948,12 +2299,21 @@ class SubtitleApp:
         if not 12 <= font_size <= 160:
             raise ValueError("字幕字号应在 12 到 160 之间。")
         if not 0 <= outline_size <= 12:
-            raise ValueError("黑色描边宽度应在 0 到 12 之间。")
+            raise ValueError("描边宽度应在 0 到 12 之间。")
         if not 0 <= margin_v <= 1000:
             raise ValueError("距底部应在 0 到 1000 之间。")
-        if self.burn_font_color.get() not in SUBTITLE_COLOR_CHOICES:
-            raise ValueError("请选择列表中的字幕颜色。")
-        return font_name, font_size, self.burn_font_color.get(), outline_size, margin_v
+        font_color = self.burn_font_color.get().strip()
+        outline_color = self.burn_outline_color.get().strip()
+        subtitle_color_to_ass(font_color)
+        subtitle_color_to_ass(outline_color)
+        return (
+            font_name,
+            font_size,
+            font_color,
+            outline_color,
+            outline_size,
+            margin_v,
+        )
 
     def _preview_burn_style(self) -> None:
         """Render a styled still frame in a worker so the main window stays responsive."""
@@ -1976,7 +2336,14 @@ class SubtitleApp:
             output = str(Path(video).parent)
             self.output_dir.set(output)
         try:
-            font_name, font_size, font_color, outline_size, margin_v = self._get_burn_style_values()
+            (
+                font_name,
+                font_size,
+                font_color,
+                outline_color,
+                outline_size,
+                margin_v,
+            ) = self._get_burn_style_values()
         except ValueError as exc:
             messagebox.showwarning("样式设置不正确", str(exc))
             return
@@ -1993,6 +2360,7 @@ class SubtitleApp:
                 font_name,
                 font_size,
                 font_color,
+                outline_color,
                 outline_size,
                 margin_v,
                 preview_index,
@@ -2010,6 +2378,7 @@ class SubtitleApp:
         font_name: str,
         font_size: int,
         font_color: str,
+        outline_color: str,
         outline_size: float,
         margin_v: int,
         preview_index: int,
@@ -2023,6 +2392,7 @@ class SubtitleApp:
                 font_name=font_name,
                 font_size=font_size,
                 font_color=font_color,
+                outline_color=outline_color,
                 outline_size=outline_size,
                 margin_v=margin_v,
                 preview_index=preview_index,
@@ -2081,7 +2451,11 @@ class SubtitleApp:
     def _on_drop(self, event) -> None:
         paths = self.root.tk.splitlist(event.data)
         if paths:
-            if self.run_mode.get() in ("split_chinese", "hallucination_cleanup"):
+            if self.run_mode.get() in (
+                "split_chinese",
+                "hallucination_cleanup",
+                "reorder_bilingual",
+            ):
                 self._set_subtitle_a(paths[0])
             else:
                 self._set_video(paths[0])
@@ -2111,6 +2485,7 @@ class SubtitleApp:
         title = {
             "hallucination_cleanup": "添加要审核的字幕",
             "split_chinese": "选择中日双语字幕",
+            "reorder_bilingual": "选择要调整行序的中日双语字幕",
             "merge_subtitles": "选择字幕 A",
         }.get(mode, "选择已翻译的字幕 A")
         path = filedialog.askopenfilename(
@@ -2138,6 +2513,7 @@ class SubtitleApp:
             "split_chinese",
             "merge_subtitles",
             "hallucination_cleanup",
+            "reorder_bilingual",
         ) and not self.output_dir.get():
             self.output_dir.set(str(subtitle.parent.resolve()))
         self._update_preview()
@@ -2202,6 +2578,20 @@ class SubtitleApp:
                 f"登录 Cookie：{self.download_cookie_browser.get()}"
             )
             return
+        if mode == "reorder_bilingual":
+            if not self.subtitle_a_path.get():
+                self.output_preview.set("统一双语字幕行序：请选择中日双语 .srt 文件。")
+                return
+            output_dir = self.output_dir.get() or str(Path(self.subtitle_a_path.get()).parent)
+            reordered = build_bilingual_order_path(
+                self.subtitle_a_path.get(), output_dir
+            )
+            self.output_preview.set(
+                f"原双语字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
+                f"调整后字幕：{reordered.name}\n"
+                f"处理方式：{self.bilingual_order.get()}"
+            )
+            return
         if mode == "split_chinese":
             if not self.subtitle_a_path.get():
                 self.output_preview.set("字幕拆分模式：请选择中日双语字幕文件。")
@@ -2251,7 +2641,7 @@ class SubtitleApp:
                 + "\n样式："
                 + f"{self.burn_font_name.get() or '未选择字体'} / "
                 + f"{self.burn_font_color.get()} / {self.burn_font_size.get()} 号 / "
-                + f"黑色描边 {self.burn_outline_size.get()} / "
+                + f"{self.burn_outline_color.get()} 描边 {self.burn_outline_size.get()} / "
                 + f"距底部 {self.burn_margin_v.get()}"
             )
             return
@@ -2285,6 +2675,7 @@ class SubtitleApp:
         mode = self.run_mode.get()
         if mode not in (
             "split_chinese",
+            "reorder_bilingual",
             "download_mp4",
             "merge_subtitles",
             "hallucination_cleanup",
@@ -2303,22 +2694,29 @@ class SubtitleApp:
         if mode in (
             "second_only",
             "split_chinese",
+            "reorder_bilingual",
             "burn_subtitles",
             "hallucination_cleanup",
         ) and not subtitle_a:
             required_name = {
                 "split_chinese": "中日双语字幕",
+                "reorder_bilingual": "要调整行序的中日双语字幕",
                 "second_only": "翻译字幕 A",
                 "burn_subtitles": "要烧录的字幕",
                 "hallucination_cleanup": "要审核的字幕",
             }[mode]
             messagebox.showwarning("请选择字幕", f"请选择{required_name}（.srt）。")
             return
-        if mode in ("split_chinese", "hallucination_cleanup") and not output:
+        if mode in (
+            "split_chinese",
+            "reorder_bilingual",
+            "hallucination_cleanup",
+        ) and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
         if mode in (
             "split_chinese",
+            "reorder_bilingual",
             "burn_subtitles",
             "download_mp4",
             "merge_subtitles",
@@ -2354,6 +2752,9 @@ class SubtitleApp:
         if mode == "split_chinese":
             split_output = build_chinese_only_path(subtitle_a, output)
             existing = [split_output.name] if split_output.exists() else []
+        elif mode == "reorder_bilingual":
+            reordered = build_bilingual_order_path(subtitle_a, output)
+            existing = [reordered.name] if reordered.exists() else []
         elif mode == "hallucination_cleanup":
             cleaned_path = build_hallucination_cleanup_path(subtitle_a, output)
             existing = [cleaned_path.name] if cleaned_path.exists() else []
@@ -2396,12 +2797,26 @@ class SubtitleApp:
 
         if mode == "burn_subtitles":
             try:
-                font_name, font_size, font_color, outline_size, margin_v = self._get_burn_style_values()
+                (
+                    font_name,
+                    font_size,
+                    font_color,
+                    outline_color,
+                    outline_size,
+                    margin_v,
+                ) = self._get_burn_style_values()
             except ValueError as exc:
                 messagebox.showwarning("样式设置不正确", str(exc))
                 return
         else:
-            font_name, font_size, font_color, outline_size, margin_v = "微软雅黑", 16, "白色", 0.8, 10
+            font_name, font_size, font_color, outline_color, outline_size, margin_v = (
+                "微软雅黑",
+                16,
+                "白色",
+                "黑色",
+                0.8,
+                10,
+            )
 
         self.running = True
         self._start_elapsed_timer()
@@ -2415,10 +2830,17 @@ class SubtitleApp:
             "first_only": "仅生成 A",
             "second_only": "仅生成 B",
             "split_chinese": "提取中文字幕",
+            "reorder_bilingual": "统一双语字幕行序",
             "burn_subtitles": "转换 MP4 并烧录字幕",
             "download_mp4": "下载 MP4",
         }[mode]
-        source_description = download_link if mode == "download_mp4" else video
+        source_description = (
+            download_link
+            if mode == "download_mp4"
+            else subtitle_a
+            if mode in ("split_chinese", "reorder_bilingual")
+            else video
+        )
         self._append_log(f"开始处理（{action}）：{source_description}")
         worker = threading.Thread(
             target=self._run_worker,
@@ -2441,8 +2863,12 @@ class SubtitleApp:
                 font_name,
                 font_size,
                 font_color,
+                outline_color,
                 outline_size,
                 margin_v,
+                BILINGUAL_ORDER_LABELS.get(
+                    self.bilingual_order.get(), "chinese_first"
+                ),
                 self._snapshot_whisper_values(self.first_whisper_values),
                 self._snapshot_whisper_values(self.second_whisper_values),
             ),
@@ -2671,8 +3097,10 @@ class SubtitleApp:
         font_name: str,
         font_size: int,
         font_color: str,
+        outline_color: str,
         outline_size: float,
         margin_v: int,
+        bilingual_order: str,
         first_whisper_values: dict[str, str],
         second_whisper_values: dict[str, str],
     ) -> None:
@@ -2717,6 +3145,13 @@ class SubtitleApp:
                         output,
                         log_callback=lambda message: self.events.put(("log", message)),
                     )
+                elif mode == "reorder_bilingual":
+                    result = reorder_bilingual_subtitles(
+                        subtitle_a,
+                        output,
+                        order=bilingual_order,
+                        log_callback=lambda message: self.events.put(("log", message)),
+                    )
                 elif mode == "burn_subtitles":
                     result = burn_subtitles_to_mp4(
                         video,
@@ -2725,6 +3160,7 @@ class SubtitleApp:
                         font_name=font_name,
                         font_size=font_size,
                         font_color=font_color,
+                        outline_color=outline_color,
                         outline_size=outline_size,
                         margin_v=margin_v,
                         log_callback=lambda message: self.events.put(("log", message)),
@@ -2841,6 +3277,15 @@ class SubtitleApp:
                         messagebox.showinfo(
                             "中文字幕已提取",
                             f"仅中文字幕已保存到：\n{result.chinese_only}{elapsed_suffix}",
+                        )
+                    elif mode == "reorder_bilingual":
+                        messagebox.showinfo(
+                            "字幕行序已调整",
+                            f"调整后的字幕已保存到：\n{result.reordered_subtitle}\n\n"
+                            f"检查双行字幕：{result.processed_count} 条\n"
+                            f"实际交换：{result.swapped_count} 条\n"
+                            f"无法自动判断并保留：{result.ambiguous_count} 条"
+                            f"{elapsed_suffix}",
                         )
                     elif mode == "burn_subtitles":
                         messagebox.showinfo(

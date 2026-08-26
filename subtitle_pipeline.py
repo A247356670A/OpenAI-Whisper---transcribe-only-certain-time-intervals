@@ -83,6 +83,17 @@ class SubtitleSplitOutput:
 
 
 @dataclass(frozen=True)
+class BilingualOrderOutput:
+    """A bilingual SRT whose Chinese/Japanese line order was normalized."""
+
+    source_subtitle: Path
+    reordered_subtitle: Path
+    processed_count: int
+    swapped_count: int
+    ambiguous_count: int
+
+
+@dataclass(frozen=True)
 class BurnedSubtitleVideoOutput:
     """An MP4 video whose image permanently includes the selected subtitles."""
 
@@ -129,11 +140,41 @@ SUBTITLE_FONT_ALIASES = {"微软雅黑": "Microsoft YaHei"}
 
 SUBTITLE_COLOR_CHOICES = {
     "白色": "&H00FFFFFF",
+    "黑色": "&H00000000",
     "黄色": "&H0000FFFF",
     "青色": "&H00FFFF00",
     "绿色": "&H0000FF00",
     "粉红色": "&H00CC66FF",
 }
+
+
+def subtitle_color_to_ass(color: str) -> str:
+    """Convert a named or #RRGGBB colour to libass &HAABBGGRR format."""
+    value = str(color).strip()
+    if value in SUBTITLE_COLOR_CHOICES:
+        return SUBTITLE_COLOR_CHOICES[value]
+    match = re.fullmatch(r"#?([0-9A-Fa-f]{6})", value)
+    if not match:
+        raise ValueError("颜色必须选择预设名称，或填写 #RRGGBB，例如 #FFFFFF。")
+    red_green_blue = match.group(1).upper()
+    red, green, blue = (
+        red_green_blue[0:2],
+        red_green_blue[2:4],
+        red_green_blue[4:6],
+    )
+    return f"&H00{blue}{green}{red}"
+
+
+def subtitle_color_to_hex(color: str) -> str:
+    """Return a Tk-compatible #RRGGBB value for a named or custom colour."""
+    ass_color = subtitle_color_to_ass(color)
+    blue_green_red = ass_color[-6:]
+    blue, green, red = (
+        blue_green_red[0:2],
+        blue_green_red[2:4],
+        blue_green_red[4:6],
+    )
+    return f"#{red}{green}{blue}"
 
 
 @dataclass(frozen=True)
@@ -217,6 +258,14 @@ def build_chinese_only_path(
     """Return the non-destructive output name for Chinese-only subtitles."""
     source = Path(bilingual_subtitle_path)
     return Path(output_dir) / f"{source.stem}_zh.srt"
+
+
+def build_bilingual_order_path(
+    bilingual_subtitle_path: str | Path, output_dir: str | Path
+) -> Path:
+    """Return the non-destructive output name for a reordered bilingual SRT."""
+    source = Path(bilingual_subtitle_path)
+    return Path(output_dir) / f"{source.stem}_ordered.srt"
 
 
 def build_burned_video_path(video_path: str | Path, output_dir: str | Path) -> Path:
@@ -1013,6 +1062,103 @@ def extract_chinese_subtitles(
     return SubtitleSplitOutput(source_subtitle=source, chinese_only=chinese_only)
 
 
+def reorder_bilingual_subtitles(
+    bilingual_subtitle_path: str | Path,
+    output_dir: str | Path | None = None,
+    *,
+    order: str = "chinese_first",
+    log_callback: LogCallback | None = None,
+) -> BilingualOrderOutput:
+    """Normalize or forcibly swap the first two text lines of each SRT entry.
+
+    Automatic modes identify Japanese by kana and the translated Chinese line
+    by Han characters without kana.  Ambiguous entries are deliberately kept
+    unchanged so that names, numbers, or all-kanji Japanese are not damaged.
+    """
+    valid_orders = {"chinese_first", "japanese_first", "swap_all"}
+    if order not in valid_orders:
+        raise ValueError("字幕行顺序选项无效。")
+    source = Path(bilingual_subtitle_path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"找不到中日双语字幕文件：{source}")
+    if source.suffix.lower() != ".srt":
+        raise ValueError("请选择 .srt 字幕文件。")
+
+    destination = (
+        Path(output_dir).expanduser().resolve() if output_dir else source.parent
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    reordered = build_bilingual_order_path(source, destination)
+    content = source.read_text(encoding="utf-8-sig")
+    blocks = re.split(r"\r?\n[ \t]*\r?\n", content.strip()) if content.strip() else []
+    output_blocks: list[str] = []
+    processed_count = 0
+    swapped_count = 0
+    ambiguous_count = 0
+    kana_pattern = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\uff66-\uff9f]")
+    han_pattern = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+    for block in blocks:
+        lines = block.splitlines()
+        time_line_index = next(
+            (index for index, line in enumerate(lines) if "-->" in line), None
+        )
+        if time_line_index is None:
+            output_blocks.append(block)
+            continue
+        text_indexes = [
+            index
+            for index in range(time_line_index + 1, len(lines))
+            if lines[index].strip()
+        ]
+        if len(text_indexes) < 2:
+            output_blocks.append("\n".join(lines))
+            continue
+
+        processed_count += 1
+        first_index, second_index = text_indexes[:2]
+        should_swap = order == "swap_all"
+        if order != "swap_all":
+            first, second = lines[first_index], lines[second_index]
+            first_is_japanese = bool(kana_pattern.search(first))
+            second_is_japanese = bool(kana_pattern.search(second))
+            first_is_chinese = bool(han_pattern.search(first)) and not first_is_japanese
+            second_is_chinese = bool(han_pattern.search(second)) and not second_is_japanese
+            detected = (
+                (first_is_japanese and second_is_chinese)
+                or (first_is_chinese and second_is_japanese)
+            )
+            if not detected:
+                ambiguous_count += 1
+            elif order == "chinese_first":
+                should_swap = first_is_japanese
+            else:
+                should_swap = first_is_chinese
+        if should_swap:
+            lines[first_index], lines[second_index] = lines[second_index], lines[first_index]
+            swapped_count += 1
+        output_blocks.append("\n".join(lines))
+
+    reordered.write_text(
+        "\n\n".join(output_blocks) + ("\n" if output_blocks else ""), encoding="utf-8"
+    )
+    if order == "swap_all":
+        message = f"已强制交换 {swapped_count} 条字幕的前两行"
+    else:
+        message = (
+            f"已检查 {processed_count} 条双行字幕，交换 {swapped_count} 条；"
+            f"{ambiguous_count} 条无法可靠判断语言，保持原样"
+        )
+    _log(log_callback, f"{message}：{reordered}")
+    return BilingualOrderOutput(
+        source_subtitle=source,
+        reordered_subtitle=reordered,
+        processed_count=processed_count,
+        swapped_count=swapped_count,
+        ambiguous_count=ambiguous_count,
+    )
+
+
 def _entries_overlap(first: SubtitleEntry, second: SubtitleEntry) -> bool:
     """Return whether two subtitle intervals overlap by a positive duration."""
     return max(first[0], second[0]) < min(first[1], second[1])
@@ -1247,6 +1393,7 @@ def _build_subtitle_filter(
     font_name: str,
     font_size: int,
     font_color: str,
+    outline_color: str,
     outline_size: float,
     margin_v: int,
 ) -> str:
@@ -1260,15 +1407,12 @@ def _build_subtitle_filter(
         raise ValueError("字幕描边宽度必须在 0 到 12 之间。")
     if not 0 <= margin_v <= 1000:
         raise ValueError("字幕距底部位置必须在 0 到 1000 之间。")
-    try:
-        primary_colour = SUBTITLE_COLOR_CHOICES[font_color]
-    except KeyError as exc:
-        raise ValueError("请选择列表中的字幕颜色。") from exc
-    # ASS uses &HAABBGGRR.  A black outline keeps every selectable text colour
-    # readable on bright footage; Alignment=2 anchors captions at the bottom.
+    primary_colour = subtitle_color_to_ass(font_color)
+    outline_colour = subtitle_color_to_ass(outline_color)
+    # ASS uses &HAABBGGRR; Alignment=2 anchors captions at the bottom.
     force_style = (
         f"FontName={font_name},FontSize={font_size},"
-        f"PrimaryColour={primary_colour},OutlineColour=&H00000000,"
+        f"PrimaryColour={primary_colour},OutlineColour={outline_colour},"
         f"BorderStyle=1,Outline={outline_size:g},Shadow=0,Alignment=2,MarginV={margin_v}"
     )
     return (
@@ -1285,6 +1429,7 @@ def generate_subtitle_preview(
     font_name: str = "微软雅黑",
     font_size: int = 16,
     font_color: str = "白色",
+    outline_color: str = "黑色",
     outline_size: float = 0.8,
     margin_v: int = 10,
     preview_index: int = 0,
@@ -1316,6 +1461,7 @@ def generate_subtitle_preview(
         font_name=font_name,
         font_size=font_size,
         font_color=font_color,
+        outline_color=outline_color,
         outline_size=outline_size,
         margin_v=margin_v,
     )
@@ -1512,6 +1658,7 @@ def burn_subtitles_to_mp4(
     font_name: str = "微软雅黑",
     font_size: int = 16,
     font_color: str = "白色",
+    outline_color: str = "黑色",
     outline_size: float = 0.8,
     margin_v: int = 10,
     log_callback: LogCallback | None = None,
@@ -1545,6 +1692,7 @@ def burn_subtitles_to_mp4(
         font_name=font_name,
         font_size=font_size,
         font_color=font_color,
+        outline_color=outline_color,
         outline_size=outline_size,
         margin_v=margin_v,
     )
