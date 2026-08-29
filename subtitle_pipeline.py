@@ -147,6 +147,12 @@ SUBTITLE_COLOR_CHOICES = {
     "粉红色": "&H00CC66FF",
 }
 
+# Keep preview windows compact even for 4K or portrait videos.  Scaling occurs
+# after libass renders the subtitle, so the text-to-video proportions still
+# match the final full-resolution burn.
+SUBTITLE_PREVIEW_MAX_WIDTH = 960
+SUBTITLE_PREVIEW_MAX_HEIGHT = 540
+
 
 def subtitle_color_to_ass(color: str) -> str:
     """Convert a named or #RRGGBB colour to libass &HAABBGGRR format."""
@@ -1433,6 +1439,8 @@ def generate_subtitle_preview(
     outline_size: float = 0.8,
     margin_v: int = 10,
     preview_index: int = 0,
+    preview_max_width: int = SUBTITLE_PREVIEW_MAX_WIDTH,
+    preview_max_height: int = SUBTITLE_PREVIEW_MAX_HEIGHT,
     log_callback: LogCallback | None = None,
 ) -> SubtitlePreviewOutput:
     """Render a single styled subtitle frame without changing the source video."""
@@ -1454,6 +1462,8 @@ def generate_subtitle_preview(
         raise ValueError("字幕文件没有可用于预览的字幕内容。")
     if not 0 <= preview_index < len(entries):
         raise ValueError("预览字幕序号超出字幕文件范围。")
+    if not 320 <= preview_max_width <= 1920 or not 180 <= preview_max_height <= 1080:
+        raise ValueError("字幕预览尺寸超出允许范围。")
     preview_time = entries[preview_index][0] + 0.05
     preview_image = build_subtitle_preview_path(source_video, destination)
     subtitle_filter = _build_subtitle_filter(
@@ -1467,7 +1477,14 @@ def generate_subtitle_preview(
     )
     # Fast seek to the first caption, then restore its source PTS so libass
     # evaluates the SRT at the correct point on the original timeline.
-    filter_value = f"setpts=PTS+{preview_time:.3f}/TB,{subtitle_filter},scale='min(960,iw)':-2"
+    preview_scale = (
+        f"scale='min({preview_max_width},iw)':"
+        f"'min({preview_max_height},ih)':"
+        "force_original_aspect_ratio=decrease"
+    )
+    filter_value = (
+        f"setpts=PTS+{preview_time:.3f}/TB,{subtitle_filter},{preview_scale}"
+    )
     command = [
         ffmpeg,
         "-hide_banner",

@@ -77,7 +77,7 @@ IS_MACOS = sys.platform == "darwin"
 APP_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_settings.json"
 APP_SETTINGS_VERSION = 3
 PARAMETER_SETTINGS_PATH = Path.home() / ".japanese_subtitle_extractor_parameters.json"
-PARAMETER_SETTINGS_VERSION = 2
+PARAMETER_SETTINGS_VERSION = 3
 SUBTITLE_STYLE_PRESETS_PATH = Path.home() / ".japanese_subtitle_extractor_styles.json"
 SUBTITLE_STYLE_PRESETS_VERSION = 1
 BUILTIN_NOTIFICATION_PATH = (
@@ -134,6 +134,12 @@ BILINGUAL_ORDER_HELP = """作用：调整中日双语 SRT 中每条字幕上下�
 
 “强制交换”不判断语言，会把每条双行字幕的第一行和第二行全部互换。单行字幕保持不变。原字幕文件永远不会修改。"""
 
+SUBTITLE_PREVIEW_SIZE_LABELS = {
+    "小（720×405）": (720, 405),
+    "中（960×540）": (960, 540),
+    "大（1280×720）": (1280, 720),
+}
+
 MODEL_CHOICES = ("tiny", "base", "small", "medium", "large-v2", "large-v3")
 
 
@@ -156,6 +162,7 @@ def default_parameter_settings() -> dict[str, object]:
         "burn_font_size": "16",
         "burn_outline_size": "0.8",
         "burn_margin_v": "10",
+        "burn_preview_size": "中（960×540）",
         "first_whisper_values": default_option_values("first"),
         "second_whisper_values": default_option_values("second"),
     }
@@ -274,6 +281,11 @@ MAIN_PARAMETER_HELP = {
 保存：点击“保存当前”并输入名称；使用已有名称时会询问是否覆盖。删除只移除预设，不会删除字幕或视频。
 
 注意：预设保存在用户目录的 JSON 设置中，不包含视频、字幕或输出路径。""",
+    "burn_preview_size": """作用：控制字幕样式预览图的最大尺寸，不改变正式烧录视频的分辨率。
+
+小：最大 720×405，适合小屏幕；中：最大 960×540，是默认值；大：最大 1280×720，方便仔细观察字体、描边和位置。
+
+预览始终保持原视频宽高比，小分辨率视频不会被强制放大。切换尺寸后，点击“预览字幕样式”或预览窗口中的刷新按钮重新生成。""",
 }
 
 
@@ -445,6 +457,7 @@ def load_parameter_settings(
         "burn_font_size",
         "burn_outline_size",
         "burn_margin_v",
+        "burn_preview_size",
     )
     for key in string_keys:
         value = loaded.get(key)
@@ -478,6 +491,8 @@ def load_parameter_settings(
         settings["download_cookie_browser"] = defaults["download_cookie_browser"]
     if settings["model_name"] not in MODEL_CHOICES:
         settings["model_name"] = defaults["model_name"]
+    if settings["burn_preview_size"] not in SUBTITLE_PREVIEW_SIZE_LABELS:
+        settings["burn_preview_size"] = defaults["burn_preview_size"]
     for color_key in ("burn_font_color", "burn_outline_color"):
         try:
             subtitle_color_to_ass(str(settings[color_key]))
@@ -1249,6 +1264,9 @@ class SubtitleApp:
         self.burn_margin_v = tk.StringVar(
             value=str(saved_parameters["burn_margin_v"])
         )
+        self.burn_preview_size = tk.StringVar(
+            value=str(saved_parameters["burn_preview_size"])
+        )
         self.subtitle_style_presets = load_subtitle_style_presets()
         self.burn_preset_name = tk.StringVar()
         self.output_preview = tk.StringVar(value="请先选择视频文件。")
@@ -1412,6 +1430,7 @@ class SubtitleApp:
             "burn_font_size": self.burn_font_size.get(),
             "burn_outline_size": self.burn_outline_size.get(),
             "burn_margin_v": self.burn_margin_v.get(),
+            "burn_preview_size": self.burn_preview_size.get(),
             "first_whisper_values": self._snapshot_whisper_values(
                 self.first_whisper_values
             ),
@@ -1486,6 +1505,7 @@ class SubtitleApp:
         self.burn_font_size.set(str(defaults["burn_font_size"]))
         self.burn_outline_size.set(str(defaults["burn_outline_size"]))
         self.burn_margin_v.set(str(defaults["burn_margin_v"]))
+        self.burn_preview_size.set(str(defaults["burn_preview_size"]))
         for key, value in dict(defaults["first_whisper_values"]).items():
             self.first_whisper_values[key].set(value)
         for key, value in dict(defaults["second_whisper_values"]).items():
@@ -1936,11 +1956,32 @@ class SubtitleApp:
             text="删除预设",
             command=self._delete_selected_subtitle_style_preset,
         ).grid(row=2, column=4, sticky="w", pady=(8, 0))
+        parameter_label(
+            self.burn_style_frame,
+            "预览尺寸",
+            "字幕样式预览尺寸",
+            MAIN_PARAMETER_HELP["burn_preview_size"],
+        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+        self.burn_preview_size_box = ttk.Combobox(
+            self.burn_style_frame,
+            state="readonly",
+            textvariable=self.burn_preview_size,
+            values=tuple(SUBTITLE_PREVIEW_SIZE_LABELS),
+            width=22,
+        )
+        self.burn_preview_size_box.grid(
+            row=3, column=1, sticky="w", padx=(8, 20), pady=(8, 0)
+        )
+        ttk.Label(
+            self.burn_style_frame,
+            text="只改变预览窗口大小，不影响正式烧录画质。",
+            style="Hint.TLabel",
+        ).grid(row=3, column=2, columnspan=3, sticky="w", pady=(8, 0))
         self.style_preview_button = ttk.Button(
             self.burn_style_frame, text="预览字幕样式", command=self._preview_burn_style
         )
         self.style_preview_button.grid(
-            row=2, column=5, sticky="w", padx=(8, 0), pady=(8, 0)
+            row=3, column=5, sticky="w", padx=(8, 0), pady=(8, 0)
         )
 
         self.preview_frame = ttk.LabelFrame(self.root, text="将生成的文件", padding=(9, 6))
@@ -2347,6 +2388,9 @@ class SubtitleApp:
         except ValueError as exc:
             messagebox.showwarning("样式设置不正确", str(exc))
             return
+        preview_width, preview_height = SUBTITLE_PREVIEW_SIZE_LABELS.get(
+            self.burn_preview_size.get(), SUBTITLE_PREVIEW_SIZE_LABELS["中（960×540）"]
+        )
         self.style_preview_button.configure(state="disabled")
         if preview_window is not None and preview_window.winfo_exists():
             preview_window.refresh_button.configure(state="disabled")
@@ -2364,6 +2408,8 @@ class SubtitleApp:
                 outline_size,
                 margin_v,
                 preview_index,
+                preview_width,
+                preview_height,
                 preview_window,
             ),
             daemon=True,
@@ -2382,6 +2428,8 @@ class SubtitleApp:
         outline_size: float,
         margin_v: int,
         preview_index: int,
+        preview_width: int,
+        preview_height: int,
         preview_window: tk.Toplevel | None,
     ) -> None:
         try:
@@ -2396,6 +2444,8 @@ class SubtitleApp:
                 outline_size=outline_size,
                 margin_v=margin_v,
                 preview_index=preview_index,
+                preview_max_width=preview_width,
+                preview_max_height=preview_height,
                 log_callback=lambda message: self.events.put(("log", message)),
             )
             self.events.put(("preview", (result, preview_window)))

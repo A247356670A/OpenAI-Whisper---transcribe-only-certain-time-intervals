@@ -166,6 +166,7 @@ class SubtitlePipelineTests(unittest.TestCase):
                     "burn_font_color": "#12AB34",
                     "burn_outline_color": "#445566",
                     "burn_font_size": "28",
+                    "burn_preview_size": "大（1280×720）",
                     "unknown_future_parameter": "ignored",
                 }
             )
@@ -182,6 +183,7 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertEqual(loaded["burn_font_color"], "#12AB34")
             self.assertEqual(loaded["burn_outline_color"], "#445566")
             self.assertEqual(loaded["burn_font_size"], "28")
+            self.assertEqual(loaded["burn_preview_size"], "大（1280×720）")
             self.assertEqual(
                 loaded["first_whisper_values"]["initial_prompt"], "角色名"
             )
@@ -190,6 +192,7 @@ class SubtitlePipelineTests(unittest.TestCase):
             settings_path.write_text(
                 '{"model_name": "invalid", "merge_gap": "-2", '
                 '"burn_font_color": "透明", "burn_outline_color": "#ABCDE", '
+                '"burn_preview_size": "巨大", '
                 '"burn_font_size": "huge", "first_whisper_values": []}',
                 encoding="utf-8",
             )
@@ -202,6 +205,9 @@ class SubtitlePipelineTests(unittest.TestCase):
                 recovered["burn_outline_color"], defaults["burn_outline_color"]
             )
             self.assertEqual(recovered["burn_font_size"], defaults["burn_font_size"])
+            self.assertEqual(
+                recovered["burn_preview_size"], defaults["burn_preview_size"]
+            )
             self.assertEqual(
                 recovered["first_whisper_values"], defaults["first_whisper_values"]
             )
@@ -494,6 +500,8 @@ class SubtitlePipelineTests(unittest.TestCase):
                     font_color="青色",
                     outline_size=2,
                     margin_v=64,
+                    preview_max_width=1280,
+                    preview_max_height=720,
                 )
 
             command = popen.call_args.args[0]
@@ -508,6 +516,8 @@ class SubtitlePipelineTests(unittest.TestCase):
             self.assertIn("PrimaryColour=&H00FFFF00", subtitle_filter)
             self.assertIn("OutlineColour=&H00000000", subtitle_filter)
             self.assertIn("MarginV=64", subtitle_filter)
+            self.assertIn("scale='min(1280,iw)':'min(720,ih)'", subtitle_filter)
+            self.assertIn("force_original_aspect_ratio=decrease", subtitle_filter)
 
     def test_burn_subtitles_marks_non_mp4_as_conversion_input(self):
         class _FakeProcess:
