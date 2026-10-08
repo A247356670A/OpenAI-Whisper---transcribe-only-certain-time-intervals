@@ -1,0 +1,26 @@
+{
+  "sourceCues": 990,
+  "outputCues": 972,
+  "changed": 117,
+  "deleted": 18,
+  "pending": 146,
+  "sha256": "53876fbf23db49a38a3c86953a4084dacb5fc66d4eb0ed9c31acec993b457347",
+  "timeChanges": [
+    247
+  ],
+  "glossaryOriginalRows": 1468,
+  "glossaryAddedRows": 56,
+  "glossaryOutputRows": 1524,
+  "originalGlossaryPreserved": true,
+  "newConflicts": 0,
+  "existingConflicts": [],
+  "existingDuplicateRows": [],
+  "srtChecks": {
+    "continuousNumbering": true,
+    "positiveDuration": true,
+    "sorted": true,
+    "noEmbeddedTimecodes": true,
+    "unchangedTimesExceptRecovered247": true
+  },
+  "glossarySha256": "949088176c3c11306b86a8665a1956fcfce4c633e3eecc14fd7458115bd919c7"
+}

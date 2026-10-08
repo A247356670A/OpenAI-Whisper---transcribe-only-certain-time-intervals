@@ -17,7 +17,13 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from subtitle_proofreading import ProofreadingDialog
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
+from japanese_correction import (
+    build_japanese_correction_paths,
+    complete_japanese_correction,
+    prepare_japanese_correction,
+)
 from SrtMerge import seconds_to_srt_time
 from subtitle_pipeline import (
     build_output_paths,
@@ -69,6 +75,11 @@ except ImportError:  # The rest of the GUI is still useful without drag/drop.
 
 VIDEO_FILE_TYPES = [
     ("视频或音频", "*.mp4 *.mkv *.avi *.mov *.webm *.m4v *.mp3 *.wav *.flac *.m4a"),
+    ("所有文件", "*.*"),
+]
+
+GLOSSARY_FILE_TYPES = [
+    ("TSV 术语表", "*.tsv *.txt"),
     ("所有文件", "*.*"),
 ]
 
@@ -1180,6 +1191,139 @@ class HallucinationReviewDialog:
         self.on_complete(result)
 
 
+class JapaneseCorrectionReviewDialog:
+    """Review glossary corrections with context before applying any change."""
+
+    def __init__(self, parent: tk.Tk, prepared, on_complete) -> None:
+        self.prepared = prepared
+        self.on_complete = on_complete
+        self.accept_flags: list[tuple[int, tk.BooleanVar]] = []
+        self.window = tk.Toplevel(parent)
+        self.window.title("审核日语术语纠错")
+        fit_window_to_screen(self.window, 1380, 840, 880, 600)
+        self.window.transient(parent)
+        self.window.configure(padx=14, pady=12)
+
+        default_count = sum(
+            1 for candidate in prepared.candidates if candidate.default_selected
+        )
+        ttk.Label(
+            self.window,
+            text=(
+                f"发现 {len(prepared.candidates)} 条候选修改。术语表明确别名中有 "
+                f"{default_count} 条默认勾选；模糊相似项默认不勾选。"
+                "请结合前后文确认，原字幕不会被修改。"
+            ),
+            style="Hint.TLabel",
+            wraplength=840,
+        ).pack(anchor="w", pady=(0, 9))
+
+        holder = ttk.Frame(self.window)
+        holder.pack(fill="both", expand=True)
+        canvas = tk.Canvas(holder, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        content = ttk.Frame(canvas)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        content.columnconfigure(0, weight=1)
+
+        for card_index, candidate in enumerate(prepared.candidates, start=1):
+            self._add_candidate_card(content, card_index, candidate)
+
+        content.bind(
+            "<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.bind(
+            "<Configure>", lambda event: canvas.itemconfigure(content_window, width=event.width)
+        )
+
+        buttons = ttk.Frame(self.window)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="取消", command=self.window.destroy).pack(side="right")
+        ttk.Button(buttons, text="生成纠错后字幕", command=self._save).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(buttons, text="全部不修改", command=lambda: self._set_all(False)).pack(
+            side="left"
+        )
+        ttk.Button(
+            buttons,
+            text="恢复安全默认选择",
+            command=self._restore_defaults,
+        ).pack(side="left", padx=(0, 8))
+
+    def _add_candidate_card(self, parent: ttk.Frame, card_index: int, candidate) -> None:
+        start, end, original = candidate.entry
+        card = ttk.LabelFrame(parent, text=f"候选修改 {card_index}", padding=8)
+        card.grid(row=card_index - 1, column=0, sticky="ew", pady=(0, 8))
+        card.columnconfigure(0, weight=1)
+        flag = tk.BooleanVar(value=candidate.default_selected)
+        self.accept_flags.append((candidate.entry_index, flag))
+        ttk.Checkbutton(card, text="应用此条修改", variable=flag).grid(
+            row=0, column=0, sticky="w"
+        )
+        details = "；".join(
+            f"{change.source} → {change.target}（{change.chinese}，"
+            f"{change.confidence:.0%}，{change.reason}）"
+            for change in candidate.changes
+        )
+        ttk.Label(
+            card,
+            text=(
+                f"时间：{seconds_to_srt_time(start)} → {seconds_to_srt_time(end)}\n"
+                f"依据：{details}"
+            ),
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=820,
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(card, text=f"原文：{original}", wraplength=820).grid(
+            row=2, column=0, sticky="w", pady=(5, 0)
+        )
+        ttk.Label(card, text=f"建议：{candidate.proposed_text}", wraplength=820).grid(
+            row=3, column=0, sticky="w", pady=(3, 0)
+        )
+        previous = HallucinationReviewDialog._format_context(
+            "前一条", candidate.previous_entry
+        )
+        following = HallucinationReviewDialog._format_context(
+            "后一条", candidate.next_entry
+        )
+        ttk.Label(
+            card,
+            text=f"上下文\n{previous}\n{following}",
+            style="Hint.TLabel",
+            justify="left",
+            wraplength=820,
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
+
+    def _set_all(self, value: bool) -> None:
+        for _entry_index, flag in self.accept_flags:
+            flag.set(value)
+
+    def _restore_defaults(self) -> None:
+        defaults = {
+            candidate.entry_index: candidate.default_selected
+            for candidate in self.prepared.candidates
+        }
+        for entry_index, flag in self.accept_flags:
+            flag.set(defaults[entry_index])
+
+    def _save(self) -> None:
+        accepted_indices = {
+            entry_index for entry_index, flag in self.accept_flags if flag.get()
+        }
+        try:
+            result = complete_japanese_correction(self.prepared, accepted_indices)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("无法生成字幕", str(exc), parent=self.window)
+            return
+        self.window.destroy()
+        self.on_complete(result)
+
+
 class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -1202,6 +1346,7 @@ class SubtitleApp:
         self.video_path = tk.StringVar()
         self.subtitle_a_path = tk.StringVar()
         self.subtitle_b_path = tk.StringVar()
+        self.glossary_path = tk.StringVar()
         self.download_link = tk.StringVar()
         self.download_cookie_browser = tk.StringVar(
             value=str(saved_parameters["download_cookie_browser"])
@@ -1630,7 +1775,18 @@ class SubtitleApp:
             value="reorder_bilingual",
             variable=self.run_mode,
             command=self._on_mode_changed,
-        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=4, column=0, sticky="w", padx=(0, 18), pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame,
+            text="日语术语纠错：术语表匹配并逐项审核",
+            value="japanese_correction",
+            variable=self.run_mode,
+            command=self._on_mode_changed,
+        ).grid(row=4, column=1, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(
+            mode_frame, text="字幕人工校对：标记错误文字与评论",
+            value="proofreading", variable=self.run_mode, command=self._on_mode_changed,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Keep all mode-dependent inputs in one stable container.  Repacking
         # siblings of the whole window caused stale geometry and click areas
@@ -1679,6 +1835,20 @@ class SubtitleApp:
         if TkinterDnD is not None:
             self.subtitle_entry.drop_target_register(DND_FILES)
             self.subtitle_entry.dnd_bind("<<Drop>>", self._on_subtitle_drop)
+
+        self.glossary_row = ttk.Frame(self.input_area)
+        ttk.Label(self.glossary_row, text="术语表", width=10).pack(side="left")
+        self.glossary_entry = ttk.Entry(
+            self.glossary_row, textvariable=self.glossary_path
+        )
+        self.glossary_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.glossary_button = ttk.Button(
+            self.glossary_row, text="选择 TSV", command=self._choose_glossary
+        )
+        self.glossary_button.pack(side="left")
+        if TkinterDnD is not None:
+            self.glossary_entry.drop_target_register(DND_FILES)
+            self.glossary_entry.dnd_bind("<<Drop>>", self._on_glossary_drop)
 
         self.subtitle_b_row = ttk.Frame(self.input_area)
         ttk.Label(self.subtitle_b_row, text="字幕 B", width=10).pack(side="left")
@@ -2073,7 +2243,14 @@ class SubtitleApp:
             self.burn_style_frame.pack(fill="x", pady=(0, 6), before=self.preview_frame)
         else:
             self.burn_style_frame.pack_forget()
-        if mode == "second_only":
+        if mode == "proofreading":
+            self._show_drop_zone()
+            self.subtitle_label.configure(text="待校对字幕")
+            self.subtitle_button.configure(text="选择 SRT")
+            self.subtitle_row.pack(fill="x", pady=(14, 7))
+            self.drop_zone.configure(text="拖入需要校对的 SRT 字幕\n标记中文、日文错误并添加评论")
+            self.threshold_entry.configure(state="disabled")
+        elif mode == "second_only":
             self._show_drop_zone()
             self.video_row.pack(fill="x", pady=(14, 7))
             self.subtitle_label.configure(text="翻译字幕 A")
@@ -2106,6 +2283,16 @@ class SubtitleApp:
             self.subtitle_row.pack(fill="x", pady=(14, 7))
             self.drop_zone.configure(text="将要审核的 SRT 字幕拖到这里\n或在下方点击“添加字幕”")
             self.threshold_entry.configure(state="disabled")
+        elif mode == "japanese_correction":
+            self._show_drop_zone()
+            self.subtitle_label.configure(text="日语字幕")
+            self.subtitle_button.configure(text="选择 SRT")
+            self.subtitle_row.pack(fill="x", pady=(14, 7))
+            self.glossary_row.pack(fill="x", pady=(0, 7))
+            self.drop_zone.configure(
+                text="将 Whisper 生成的日语 SRT 拖到这里\n然后选择日中 TSV 术语表"
+            )
+            self.threshold_entry.configure(state="disabled")
         elif mode == "split_chinese":
             self._show_drop_zone()
             self.subtitle_label.configure(text="中日双语字幕")
@@ -2131,8 +2318,10 @@ class SubtitleApp:
                 self.drop_zone.configure(text="将视频拖到这里\n或点击“选择视频”")
                 self.threshold_entry.configure(state="normal")
         start_labels = {
+            "proofreading": "打开字幕校对",
             "merge_subtitles": "开始合并字幕",
             "hallucination_cleanup": "开始审核字幕",
+            "japanese_correction": "开始术语纠错",
             "download_mp4": "开始下载 MP4",
             "reorder_bilingual": "开始调整字幕行序",
         }
@@ -2167,6 +2356,7 @@ class SubtitleApp:
             self.drop_zone,
             self.video_row,
             self.subtitle_row,
+            self.glossary_row,
             self.subtitle_b_row,
             self.bilingual_order_row,
             self.link_row,
@@ -2502,9 +2692,11 @@ class SubtitleApp:
         paths = self.root.tk.splitlist(event.data)
         if paths:
             if self.run_mode.get() in (
+                "proofreading",
                 "split_chinese",
                 "hallucination_cleanup",
                 "reorder_bilingual",
+                "japanese_correction",
             ):
                 self._set_subtitle_a(paths[0])
             else:
@@ -2520,6 +2712,11 @@ class SubtitleApp:
         if paths:
             self._set_subtitle_b(paths[0])
 
+    def _on_glossary_drop(self, event) -> None:
+        paths = self.root.tk.splitlist(event.data)
+        if paths:
+            self._set_glossary(paths[0])
+
     def _set_video(self, path: str) -> None:
         video = Path(path).expanduser()
         if not video.is_file():
@@ -2533,7 +2730,9 @@ class SubtitleApp:
     def _choose_subtitle_a(self) -> None:
         mode = self.run_mode.get()
         title = {
+            "proofreading": "选择待校对字幕",
             "hallucination_cleanup": "添加要审核的字幕",
+            "japanese_correction": "选择要纠错的日语字幕",
             "split_chinese": "选择中日双语字幕",
             "reorder_bilingual": "选择要调整行序的中日双语字幕",
             "merge_subtitles": "选择字幕 A",
@@ -2553,6 +2752,13 @@ class SubtitleApp:
         if path:
             self._set_subtitle_b(path)
 
+    def _choose_glossary(self) -> None:
+        path = filedialog.askopenfilename(
+            title="选择日中 TSV 术语表", filetypes=GLOSSARY_FILE_TYPES
+        )
+        if path:
+            self._set_glossary(path)
+
     def _set_subtitle_a(self, path: str) -> None:
         subtitle = Path(path).expanduser()
         if not subtitle.is_file() or subtitle.suffix.lower() != ".srt":
@@ -2560,12 +2766,22 @@ class SubtitleApp:
             return
         self.subtitle_a_path.set(str(subtitle.resolve()))
         if self.run_mode.get() in (
+            "proofreading",
             "split_chinese",
             "merge_subtitles",
             "hallucination_cleanup",
             "reorder_bilingual",
+            "japanese_correction",
         ) and not self.output_dir.get():
             self.output_dir.set(str(subtitle.parent.resolve()))
+        self._update_preview()
+
+    def _set_glossary(self, path: str) -> None:
+        glossary = Path(path).expanduser()
+        if not glossary.is_file() or glossary.suffix.lower() not in {".tsv", ".txt"}:
+            messagebox.showerror("无法读取术语表", "请选择有效的 .tsv 或 .txt 术语表文件。")
+            return
+        self.glossary_path.set(str(glossary.resolve()))
         self._update_preview()
 
     def _set_subtitle_b(self, path: str) -> None:
@@ -2585,6 +2801,28 @@ class SubtitleApp:
 
     def _update_preview(self) -> None:
         mode = self.run_mode.get()
+        if mode == "proofreading":
+            self.output_preview.set("选择 SRT 后打开校对窗口。可选中错误文字，添加评论和建议改法。\n保存的校对 JSON 包含完整原字幕与所有标记，可重新加载或提供给精校人员；也可导出可读报告。")
+            return
+        if mode == "japanese_correction":
+            if not self.subtitle_a_path.get():
+                self.output_preview.set("日语术语纠错：请选择 Whisper 生成的日语 .srt 字幕。")
+                return
+            if not self.glossary_path.get():
+                self.output_preview.set("日语术语纠错：请选择日中 TSV 术语表。")
+                return
+            output_dir = self.output_dir.get() or str(Path(self.subtitle_a_path.get()).parent)
+            paths = build_japanese_correction_paths(
+                self.subtitle_a_path.get(), output_dir
+            )
+            self.output_preview.set(
+                f"原字幕（不会修改）：{Path(self.subtitle_a_path.get()).name}\n"
+                f"术语表（不会修改）：{Path(self.glossary_path.get()).name}\n"
+                f"纠错后字幕：{paths.corrected_srt.name}\n"
+                f"修改报告：{paths.markdown_report.name}、{paths.json_report.name}\n"
+                "明确别名默认勾选；模糊相似项默认等待人工确认。"
+            )
+            return
         if mode == "hallucination_cleanup":
             if not self.subtitle_a_path.get():
                 self.output_preview.set("清理可疑幻觉字幕：请选择要审核的 .srt 文件。")
@@ -2714,9 +2952,20 @@ class SubtitleApp:
     def _start(self) -> None:
         if self.running:
             return
+        if self.run_mode.get() == "proofreading":
+            source = self.subtitle_a_path.get().strip()
+            if not source:
+                messagebox.showwarning("请选择字幕", "请先选择或拖入待校对的 SRT 字幕。")
+                return
+            try:
+                ProofreadingDialog(self.root, source, self.output_dir.get().strip())
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("无法打开字幕", str(exc))
+            return
         video = self.video_path.get().strip()
         subtitle_a = self.subtitle_a_path.get().strip()
         subtitle_b = self.subtitle_b_path.get().strip()
+        glossary = self.glossary_path.get().strip()
         download_link = self.download_link.get().strip()
         cookie_browser = DOWNLOAD_COOKIE_BROWSER_LABELS.get(
             self.download_cookie_browser.get()
@@ -2729,13 +2978,18 @@ class SubtitleApp:
             "download_mp4",
             "merge_subtitles",
             "hallucination_cleanup",
+            "japanese_correction",
         ) and not video:
             messagebox.showwarning("请选择视频", "请拖入视频文件，或点击“选择视频”。")
             return
         if mode == "download_mp4" and not download_link:
             messagebox.showwarning("请输入链接", "请输入要下载的视频链接。")
             return
-        if not output and mode not in ("split_chinese", "hallucination_cleanup"):
+        if not output and mode not in (
+            "split_chinese",
+            "hallucination_cleanup",
+            "japanese_correction",
+        ):
             messagebox.showwarning("请选择保存位置", "请选择字幕保存文件夹。")
             return
         if mode == "merge_subtitles" and (not subtitle_a or not subtitle_b):
@@ -2747,6 +3001,7 @@ class SubtitleApp:
             "reorder_bilingual",
             "burn_subtitles",
             "hallucination_cleanup",
+            "japanese_correction",
         ) and not subtitle_a:
             required_name = {
                 "split_chinese": "中日双语字幕",
@@ -2754,6 +3009,7 @@ class SubtitleApp:
                 "second_only": "翻译字幕 A",
                 "burn_subtitles": "要烧录的字幕",
                 "hallucination_cleanup": "要审核的字幕",
+                "japanese_correction": "要纠错的日语字幕",
             }[mode]
             messagebox.showwarning("请选择字幕", f"请选择{required_name}（.srt）。")
             return
@@ -2761,6 +3017,7 @@ class SubtitleApp:
             "split_chinese",
             "reorder_bilingual",
             "hallucination_cleanup",
+            "japanese_correction",
         ) and not output:
             output = str(Path(subtitle_a).parent)
             self.output_dir.set(output)
@@ -2771,6 +3028,7 @@ class SubtitleApp:
             "download_mp4",
             "merge_subtitles",
             "hallucination_cleanup",
+            "japanese_correction",
         ):
             merge_gap, duplicate_threshold = 1.0, 0.5
         else:
@@ -2808,6 +3066,20 @@ class SubtitleApp:
         elif mode == "hallucination_cleanup":
             cleaned_path = build_hallucination_cleanup_path(subtitle_a, output)
             existing = [cleaned_path.name] if cleaned_path.exists() else []
+        elif mode == "japanese_correction":
+            if not glossary:
+                messagebox.showwarning("请选择术语表", "请选择日中 TSV 术语表。")
+                return
+            correction_paths = build_japanese_correction_paths(subtitle_a, output)
+            existing = [
+                path.name
+                for path in (
+                    correction_paths.corrected_srt,
+                    correction_paths.json_report,
+                    correction_paths.markdown_report,
+                )
+                if path.exists()
+            ]
         elif mode == "burn_subtitles":
             burned_video = build_burned_video_path(video, output)
             existing = [burned_video.name] if burned_video.exists() else []
@@ -2843,6 +3115,9 @@ class SubtitleApp:
             return
         if mode == "hallucination_cleanup":
             self._start_hallucination_cleanup(subtitle_a, output)
+            return
+        if mode == "japanese_correction":
+            self._start_japanese_correction(subtitle_a, glossary, output)
             return
 
         if mode == "burn_subtitles":
@@ -3092,6 +3367,49 @@ class SubtitleApp:
         messagebox.showinfo(
             "清理完成",
             f"已删除 {result.removed_count} 条字幕。\n清理后字幕已保存到：\n{result.output_path}",
+        )
+
+    def _start_japanese_correction(
+        self, subtitle_path: str, glossary_path: str, output: str
+    ) -> None:
+        """Prepare glossary suggestions, then require explicit review."""
+        try:
+            self.status.set("正在分析日语字幕和术语表…")
+            self.root.update_idletasks()
+            prepared = prepare_japanese_correction(
+                subtitle_path, glossary_path, output
+            )
+            self._append_log(
+                f"术语表已读取 {prepared.glossary_term_count} 组；"
+                f"发现 {len(prepared.candidates)} 条候选修改。"
+            )
+            if prepared.candidates:
+                self.status.set("请在审核窗口中确认术语修改。")
+                JapaneseCorrectionReviewDialog(
+                    self.root, prepared, self._japanese_correction_completed
+                )
+                return
+            result = complete_japanese_correction(prepared, set())
+        except (OSError, ValueError) as exc:
+            self.status.set("术语纠错失败，请检查字幕和术语表。")
+            self._append_log(f"错误：{exc}")
+            messagebox.showerror("术语纠错失败", str(exc))
+            return
+        self._japanese_correction_completed(result)
+
+    def _japanese_correction_completed(self, result) -> None:
+        self.status.set("日语术语纠错完成。")
+        self._append_log(
+            f"完成：接受 {result.applied_count}/{result.candidate_count} 条建议；"
+            f"纠错字幕：{result.corrected_srt}"
+        )
+        self._notify_task_complete()
+        messagebox.showinfo(
+            "日语术语纠错完成",
+            f"候选修改：{result.candidate_count} 条\n"
+            f"已接受：{result.applied_count} 条\n\n"
+            f"纠错后字幕：\n{result.corrected_srt}\n\n"
+            f"修改报告：\n{result.markdown_report}\n{result.json_report}",
         )
 
     @staticmethod
