@@ -3,10 +3,36 @@ import tempfile
 from pathlib import Path
 import unittest
 
-from subtitle_proofreading import create_review, save_review, load_review, review_report, _parse_cues
+from subtitle_proofreading import (create_review, save_review, load_review, review_report, _parse_cues,
+                                   load_phrase_store, save_phrase_store, remember_phrase)
 
 
 class ProofreadingTests(unittest.TestCase):
+    def test_phrase_memory_mru_persists_and_deduplicates(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "phrases.json"
+            store = load_phrase_store(path)
+            self.assertTrue(remember_phrase(store, "日文", "四月一日", "主播姓名"))
+            self.assertTrue(remember_phrase(store, "中文", "", "检查术语"))
+            self.assertTrue(remember_phrase(store, "日文", "四月一日", "主播姓名"))
+            self.assertEqual(len(store["recent"]), 2)
+            self.assertEqual(store["recent"][0]["replacement"], "四月一日")
+            store["presets"]["人名"] = [dict(item) for item in store["recent"]]
+            save_phrase_store(store, path)
+            self.assertEqual(load_phrase_store(path), store)
+
+    def test_phrase_memory_limit_and_invalid_file_fallback(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "phrases.json"
+            store = load_phrase_store(path)
+            for index in range(30):
+                remember_phrase(store, "未指定", "", f"意见 {index}")
+            self.assertEqual(len(store["recent"]), 24)
+            self.assertEqual(store["recent"][0]["comment"], "意见 29")
+            self.assertEqual(store["recent"][-1]["comment"], "意见 6")
+            path.write_text("not json", encoding="utf-8")
+            self.assertEqual(load_phrase_store(path)["recent"], [])
+
     def test_inline_number_time_and_dialogue_from_error_screenshot(self):
         cues = _parse_cues("3\n00:00:13,000 --> 00:00:14,000\n上一句\n\n4 00:00:15,060 --> 00:00:16,460 ん\n嗯\n\n5\n00:00:17,000 --> 00:00:18,000\n下一句")
         self.assertEqual(len(cues), 3)

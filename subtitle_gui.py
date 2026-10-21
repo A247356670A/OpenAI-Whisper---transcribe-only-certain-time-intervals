@@ -18,6 +18,8 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 from subtitle_proofreading import ProofreadingDialog
+from dual_model_review_gui import DualModelReviewDialog
+from qwen_pipeline import QWEN_MODELS, build_qwen_output_paths, run_qwen_two_pass
 from tkinter import colorchooser, filedialog, messagebox, simpledialog, ttk
 from japanese_correction import (
     build_japanese_correction_paths,
@@ -160,6 +162,10 @@ def default_parameter_settings() -> dict[str, object]:
         "settings_version": PARAMETER_SETTINGS_VERSION,
         "download_cookie_browser": "不使用浏览器 Cookie",
         "model_name": "large-v2",
+        "asr_engine": "Whisper",
+        "qwen_model": QWEN_MODELS[0],
+        "qwen_chunk_seconds": "60",
+        "qwen_context": "",
         "gpu_acceleration": False,
         "merge_gap": "1.0",
         "duplicate_threshold": "0.5",
@@ -455,6 +461,7 @@ def load_parameter_settings(
 
     settings = defaults.copy()
     string_keys = (
+        "asr_engine", "qwen_model", "qwen_chunk_seconds", "qwen_context",
         "download_cookie_browser",
         "model_name",
         "merge_gap",
@@ -502,6 +509,15 @@ def load_parameter_settings(
         settings["download_cookie_browser"] = defaults["download_cookie_browser"]
     if settings["model_name"] not in MODEL_CHOICES:
         settings["model_name"] = defaults["model_name"]
+    if settings["asr_engine"] not in ("Whisper", "Qwen3-ASR"):
+        settings["asr_engine"] = "Whisper"
+    if settings["qwen_model"] not in QWEN_MODELS:
+        settings["qwen_model"] = QWEN_MODELS[0]
+    try:
+        if not 10 <= float(settings["qwen_chunk_seconds"]) <= 120:
+            raise ValueError
+    except ValueError:
+        settings["qwen_chunk_seconds"] = "60"
     if settings["burn_preview_size"] not in SUBTITLE_PREVIEW_SIZE_LABELS:
         settings["burn_preview_size"] = defaults["burn_preview_size"]
     for color_key in ("burn_font_color", "burn_outline_color"):
@@ -676,6 +692,18 @@ def enable_high_dpi_awareness() -> None:
                 ctypes.windll.user32.SetProcessDPIAware()
             except (AttributeError, OSError):
                 pass
+
+
+def fit_main_window_to_screen(window: tk.Misc) -> None:
+    """Start nearly full-screen so high-DPI controls do not hide the log area.
+
+    Use the display size rather than a fixed 1600x900 pixel rectangle: fonts
+    grow with Windows scaling, but an explicit Tk geometry does not. Retain
+    normal window decorations and let the shared helper reserve screen edges.
+    """
+    width = max(1600, round(window.winfo_screenwidth() * 0.95))
+    height = max(900, round(window.winfo_screenheight() * 0.94))
+    fit_window_to_screen(window, width, height, 980, 700)
 
 
 class _QueueWriter:
@@ -1106,6 +1134,7 @@ class HallucinationReviewDialog:
             text=(
                 f"发现 {len(prepared.candidates)} 条可能的幻觉字幕。默认不会删除；"
                 "请勾选确认删除。每项均显示时间、文本及前后字幕上下文。"
+                "连续短句可能是真实应答；含翻译提示词但仍有对白的条目，建议到人工校对功能修改，勿整条删除。"
             ),
             style="Hint.TLabel",
             wraplength=780,
@@ -1327,8 +1356,8 @@ class JapaneseCorrectionReviewDialog:
 class SubtitleApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("日语字幕提取器 · Whisper 双重识别")
-        fit_window_to_screen(self.root, 1600, 900, 980, 700)
+        self.root.title("日语字幕提取器 · Whisper / Qwen3-ASR")
+        fit_main_window_to_screen(self.root)
         self.root.configure(padx=18, pady=14)
 
         saved_settings = load_app_settings()
@@ -1370,6 +1399,10 @@ class SubtitleApp:
         self.run_mode = tk.StringVar(value="full")
         self.bilingual_order = tk.StringVar(value=next(iter(BILINGUAL_ORDER_LABELS)))
         self.model_name = tk.StringVar(value=str(saved_parameters["model_name"]))
+        self.asr_engine = tk.StringVar(value=str(saved_parameters["asr_engine"]))
+        self.qwen_model = tk.StringVar(value=str(saved_parameters["qwen_model"]))
+        self.qwen_chunk_seconds = tk.StringVar(value=str(saved_parameters["qwen_chunk_seconds"]))
+        self.qwen_context = tk.StringVar(value=str(saved_parameters["qwen_context"]))
         self.gpu_acceleration = tk.BooleanVar(
             value=bool(saved_parameters["gpu_acceleration"])
         )
@@ -1560,6 +1593,10 @@ class SubtitleApp:
             "settings_version": PARAMETER_SETTINGS_VERSION,
             "download_cookie_browser": self.download_cookie_browser.get(),
             "model_name": self.model_name.get(),
+            "asr_engine": self.asr_engine.get(),
+            "qwen_model": self.qwen_model.get(),
+            "qwen_chunk_seconds": self.qwen_chunk_seconds.get(),
+            "qwen_context": self.qwen_context.get(),
             "gpu_acceleration": self.gpu_acceleration.get(),
             "merge_gap": self.merge_gap.get(),
             "duplicate_threshold": self.duplicate_threshold.get(),
@@ -1633,6 +1670,10 @@ class SubtitleApp:
         defaults = default_parameter_settings()
         self.download_cookie_browser.set(str(defaults["download_cookie_browser"]))
         self.model_name.set(str(defaults["model_name"]))
+        self.asr_engine.set("Whisper")
+        self.qwen_model.set(QWEN_MODELS[0])
+        self.qwen_chunk_seconds.set("60")
+        self.qwen_context.set("")
         self.gpu_acceleration.set(bool(defaults["gpu_acceleration"]))
         self.merge_gap.set(str(defaults["merge_gap"]))
         self.duplicate_threshold.set(str(defaults["duplicate_threshold"]))
@@ -1786,7 +1827,11 @@ class SubtitleApp:
         ttk.Radiobutton(
             mode_frame, text="字幕人工校对：标记错误文字与评论",
             value="proofreading", variable=self.run_mode, command=self._on_mode_changed,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(
+            mode_frame, text="Whisper + Qwen 双模型交叉精校…",
+            command=lambda: DualModelReviewDialog(self.root),
+        ).grid(row=5, column=1, sticky="w", pady=(4, 0))
 
         # Keep all mode-dependent inputs in one stable container.  Repacking
         # siblings of the whole window caused stale geometry and click areas
@@ -1917,6 +1962,17 @@ class SubtitleApp:
         self.output_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.output_button = ttk.Button(self.output_row, text="选择文件夹", command=self._choose_output_dir)
         self.output_button.pack(side="left")
+
+        engine_row = ttk.Frame(self.root)
+        engine_row.pack(fill="x", pady=(5, 0))
+        ttk.Label(engine_row, text="识别引擎").pack(side="left")
+        self.engine_box = ttk.Combobox(engine_row, textvariable=self.asr_engine,
+            values=("Whisper", "Qwen3-ASR"), state="readonly", width=12)
+        self.engine_box.pack(side="left", padx=6)
+        self.engine_box.bind("<<ComboboxSelected>>", lambda _event: self._update_preview())
+        ttk.Button(engine_row, text="Qwen 设置…", command=self._show_qwen_options).pack(side="left")
+        help_button(engine_row, "Qwen3-ASR 引擎", "Qwen 当前支持完整识别 A+B；仅生成 A/B 和断点续跑请选 Whisper。\nQwen 参数独立，以下 Whisper 模型和高级参数不影响 Qwen。\nQwen 自动优先 CUDA，无 CUDA 时使用 CPU；勾选 GPU 后若 CUDA 不可用则报错。\nB 人声筛选、合并间隔和去重阈值两种引擎通用。\n首次运行需下载识别与对齐模型。安装：python -m pip install -r requirements-qwen.txt").pack(side="left", padx=5)
+        ttk.Label(engine_row, text="Qwen：完整 A+B；Whisper 参数不适用", style="Hint.TLabel").pack(side="left")
 
         options = ttk.LabelFrame(self.root, text="处理设置", padding=(10, 7))
         options.pack(fill="x", pady=(7, 6))
@@ -2217,13 +2273,45 @@ class SubtitleApp:
 
         log_box = ttk.LabelFrame(self.root, text="运行日志", padding=7)
         log_box.pack(fill="both", expand=True)
-        # Ten lines at the default font keep the log near one fifth of the
-        # 1600×900 default window, while still allowing it to grow on resize.
+        # Reserve ten text lines and let the log use the remaining space in
+        # the nearly full-screen startup window or after a manual resize.
         self.log = tk.Text(log_box, height=10, wrap="word", state="disabled")
         scrollbar = ttk.Scrollbar(log_box, orient="vertical", command=self.log.yview)
         self.log.configure(yscrollcommand=scrollbar.set)
         self.log.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+
+    def _show_qwen_options(self) -> None:
+        window = tk.Toplevel(self.root)
+        window.title("Qwen3-ASR 设置（完整 A+B）")
+        fit_window_to_screen(window, 760, 490, 500, 350)
+        window.columnconfigure(1, weight=1)
+        model = tk.StringVar(value=self.qwen_model.get())
+        chunk = tk.StringVar(value=self.qwen_chunk_seconds.get())
+        ttk.Label(window, text="识别模型").grid(row=0, column=0, padx=10, pady=10)
+        ttk.Combobox(window, textvariable=model, values=QWEN_MODELS, state="readonly", width=30).grid(row=0, column=1, sticky="ew", padx=10)
+        help_button(window, "Qwen 模型", "默认 1.7B；显存紧张可试 0.6B。另自动加载 0.6B ForcedAligner 生成时间轴。首次运行会下载模型；不是中文翻译模型。").grid(row=0, column=2)
+        ttk.Label(window, text="切片长度（秒）").grid(row=1, column=0, padx=10)
+        ttk.Entry(window, textvariable=chunk).grid(row=1, column=1, sticky="ew", padx=10)
+        help_button(window, "切片长度", "10～120 秒，默认 60。例如显存不足时改为 30。A 按已完成音频时间显示进度，B 按反向剪裁片段序号显示。识别和对齐使用相同片段。").grid(row=1, column=2)
+        ttk.Label(window, text="日语识别背景／人名（可空）").grid(row=2, column=0, columnspan=2, sticky="w", padx=10, pady=10)
+        help_button(window, "背景提示", "例如：ゲーム：ゼンレスゾーンゼロ。配信者：四月一日ベレト。登場人物：ロクシー、クロウ。\n给出简短日语背景，不是翻译指令；不建议塞入整份中日词表。此内容用于 A 和 B。").grid(row=2, column=2)
+        context = tk.Text(window, height=6, wrap="word")
+        context.insert("1.0", self.qwen_context.get())
+        context.grid(row=3, column=0, columnspan=3, sticky="nsew", padx=10)
+        window.rowconfigure(3, weight=1)
+        def save():
+            try:
+                if not 10 <= float(chunk.get()) <= 120:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("参数无效", "切片长度须为 10～120 秒。", parent=window)
+                return
+            self.qwen_model.set(model.get())
+            self.qwen_chunk_seconds.set(chunk.get())
+            self.qwen_context.set(context.get("1.0", "end-1c"))
+            window.destroy()
+        ttk.Button(window, text="应用（下次启动保留请点击主界面保存参数）", command=save).grid(row=4, column=0, columnspan=3, pady=10)
 
     def _show_whisper_options(self) -> None:
         WhisperOptionsDialog(
@@ -2942,7 +3030,8 @@ class SubtitleApp:
                 "本模式不会生成字幕 B，也不会合并字幕。"
             )
             return
-        outputs = build_output_paths(self.video_path.get(), self.output_dir.get())
+        builder = build_qwen_output_paths if self.asr_engine.get() == "Qwen3-ASR" else build_output_paths
+        outputs = builder(self.video_path.get(), self.output_dir.get())
         self.output_preview.set(
             f"A（完整识别）：{outputs.first_pass.name}\n"
             f"B（补全片段）：{outputs.second_pass.name}\n"
@@ -2951,6 +3040,9 @@ class SubtitleApp:
 
     def _start(self) -> None:
         if self.running:
+            return
+        if self.asr_engine.get() == "Qwen3-ASR" and self.run_mode.get() in ("first_only", "second_only"):
+            messagebox.showinfo("请选择完整识别", "Qwen 当前支持完整 A+B。仅生成 A/B 请切回 Whisper。")
             return
         if self.run_mode.get() == "proofreading":
             source = self.subtitle_a_path.get().strip()
@@ -3098,7 +3190,8 @@ class SubtitleApp:
             first_pass = build_output_paths(video, output).first_pass
             existing = [first_pass.name] if first_pass.exists() else []
         else:
-            outputs = build_output_paths(video, output)
+            builder = build_qwen_output_paths if self.asr_engine.get() == "Qwen3-ASR" else build_output_paths
+            outputs = builder(video, output)
             existing = [
                 path.name
                 for path in (outputs.first_pass, outputs.second_pass, outputs.merged)
@@ -3196,6 +3289,10 @@ class SubtitleApp:
                 ),
                 self._snapshot_whisper_values(self.first_whisper_values),
                 self._snapshot_whisper_values(self.second_whisper_values),
+                self.asr_engine.get(),
+                self.qwen_model.get(),
+                self.qwen_chunk_seconds.get(),
+                self.qwen_context.get(),
             ),
             daemon=True,
         )
@@ -3214,6 +3311,9 @@ class SubtitleApp:
         if self.running:
             return
 
+        if self.asr_engine.get() == "Qwen3-ASR":
+            messagebox.showinfo("断点功能", "Qwen 暂不支持此断点按钮。请使用普通开始按钮完成 A+B，或切回 Whisper。")
+            return
         video = self.video_path.get().strip()
         output = self.output_dir.get().strip()
         if not video:
@@ -3471,11 +3571,26 @@ class SubtitleApp:
         bilingual_order: str,
         first_whisper_values: dict[str, str],
         second_whisper_values: dict[str, str],
+        asr_engine: str = "Whisper",
+        qwen_model: str = QWEN_MODELS[0],
+        qwen_chunk_seconds: str = "60",
+        qwen_context: str = "",
     ) -> None:
         writer = _QueueWriter(self.events)
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                if mode == "second_only":
+                if mode == "full" and asr_engine == "Qwen3-ASR":
+                    result = run_qwen_two_pass(
+                        video, output, model_name=qwen_model, context=qwen_context,
+                        chunk_seconds=float(qwen_chunk_seconds), gpu_acceleration=gpu_acceleration,
+                        merge_gap=merge_gap, duplicate_threshold=duplicate_threshold,
+                        filter_b_speech=filter_b_speech, b_silero_threshold=b_silero_threshold,
+                        b_silero_min_speech_seconds=b_silero_min_speech_seconds,
+                        b_silero_min_speech_ratio=b_silero_min_speech_ratio,
+                        log_callback=lambda message: self.events.put(("log", message)),
+                        progress_callback=lambda stage, current, total: self.events.put(("progress", (stage, current, total))),
+                    )
+                elif mode == "second_only":
                     result = run_second_pass_from_subtitle(
                         video,
                         subtitle_a,

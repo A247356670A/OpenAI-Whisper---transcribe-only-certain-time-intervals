@@ -9,6 +9,8 @@
 # Other Python versions and operating systems retain the generic torch path.
 
 # Whisper and audio processing
+# Optional Qwen engine (install separately, only if needed):
+# python -m pip install -r requirements-qwen.txt
 openai-whisper
 librosa
 torch @ https://download.pytorch.org/whl/cu130/torch-2.12.1%2Bcu130-cp312-cp312-win_amd64.whl ; sys_platform == "win32" and python_version == "3.12"

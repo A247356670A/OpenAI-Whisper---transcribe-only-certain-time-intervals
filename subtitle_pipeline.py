@@ -1319,12 +1319,67 @@ HALLUCINATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "订阅引导／片尾提示",
         re.compile(r"(?:チャンネル登録|subscribe\s*(?:to|for)?)", re.IGNORECASE),
     ),
+    (
+        "翻译提示词污染（可能夹有正常对白，建议人工校对，不要直接整条删除）",
+        re.compile(r"严格(?:术语|词汇)表|(?:源词\s*→\s*(?:目标词|译词))|<\|im_end\|>"),
+    ),
+    (
+        "可疑音乐署名／账号宣传",
+        re.compile(r"sound[ _]+hodori|사운드\s*호돌이|サウンドゥ\s*ホドリ", re.IGNORECASE),
+    ),
+    (
+        "字幕制作说明混入正文（请核对上下文）",
+        re.compile(r"字幕(?:作成者|制作者).*(?:説明不可能|誤入|无法解释|误入)"),
+    ),
 )
 
 
+def _hallucination_lines(text: str) -> list[str]:
+    """Normalize wrappers per line, including bilingual and SRT HTML styling."""
+    return [re.sub(r"<[^>]+>", "", line).strip().strip("[]【】()（） \t")
+            for line in text.splitlines() if line.strip()]
+
+
 def _hallucination_reasons(text: str) -> tuple[str, ...]:
-    """Return the human-readable review reasons matched by one subtitle."""
-    return tuple(label for label, pattern in HALLUCINATION_PATTERNS if pattern.search(text))
+    """Signals only: a human must confirm deletion, including genuine outros."""
+    reasons = [label for label, pattern in HALLUCINATION_PATTERNS if pattern.search(text)]
+    lines = _hallucination_lines(text)
+    for label, expression in (
+        ("BGM／音乐标记", r"[♪♫\s]*(?:bgm|music|音楽|音乐|音樂|背景音乐|背景音樂)[♪♫\s]*"),
+        ("片尾／结束标记", r"(?:エンディング(?:テーマ)?|ending(?:\s+theme)?|end|片尾曲|片尾|结尾|結尾)"),
+        ("感谢观看／片尾致谢", r"字幕視聴ありがとうございました|感谢收看字幕|感謝收看字幕"),
+    ):
+        if any(re.fullmatch(expression, line, re.IGNORECASE) for line in lines):
+            reasons.append(label)
+    # Require the entire cue to be symbolic; do not flag dialogue containing an emoji.
+    if lines and all(re.fullmatch(r"[♪♫♬♩~～〜\s.!！。…\-]+", line) for line in lines):
+        reasons.append("纯音符／音乐占位符")
+    if lines and all(re.fullmatch(r"[🐬\ufe0f\s]+", line) for line in lines):
+        reasons.append("纯海豚表情占位符")
+    return tuple(dict.fromkeys(reasons))
+
+
+def _repeated_fragment_indices(entries) -> set[int]:
+    """Flag runs of >=3 weak fragments, never isolated acknowledgements.
+
+    These reviewed fragments can also be valid speech. Require nearby timings
+    (at most five seconds apart), and continue to leave deletion opt-in.
+    """
+    fragments = {'ん', '嗯', 'me', '我', '持っています', '我有'}
+    result: set[int] = set()
+    run: list[int] = []
+    for index, (start, end, text) in enumerate(entries):
+        lines = _hallucination_lines(text)
+        weak = bool(lines) and all(line.lower().rstrip('。.!！?？') in fragments for line in lines)
+        if not weak or (run and start - entries[run[-1]][1] > 5):
+            if len(run) >= 3:
+                result.update(run)
+            run = []
+        if weak:
+            run.append(index)
+    if len(run) >= 3:
+        result.update(run)
+    return result
 
 
 def prepare_hallucination_cleanup(
@@ -1337,9 +1392,12 @@ def prepare_hallucination_cleanup(
     destination = Path(output_dir).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     entries = _read_srt_entries(source)
+    repeated_fragments = _repeated_fragment_indices(entries)
     candidates: list[SuspiciousSubtitle] = []
     for entry_index, entry in enumerate(entries):
         reasons = _hallucination_reasons(entry[2])
+        if entry_index in repeated_fragments:
+            reasons += ("连续短碎片（低置信度，可能是真实应答，请听原音确认）",)
         if reasons:
             candidates.append(
                 SuspiciousSubtitle(

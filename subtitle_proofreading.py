@@ -6,8 +6,61 @@ from pathlib import Path
 import re
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
+
+
+PHRASE_MEMORY_PATH = Path.home() / ".japanese_subtitle_proofreading_phrases.json"
+PHRASE_MEMORY_VERSION = 1
+PHRASE_MEMORY_LIMIT = 24
+
+
+def load_phrase_store(path=PHRASE_MEMORY_PATH):
+    """Load global quick comments without tying them to one subtitle file."""
+    default = {"version": PHRASE_MEMORY_VERSION, "recent": [], "presets": {}}
+    path = Path(path)
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return default
+    if not isinstance(data, dict) or data.get("version") != PHRASE_MEMORY_VERSION:
+        return default
+
+    def valid_item(item):
+        return (isinstance(item, dict)
+                and item.get("language") in ("中文", "日文", "其他", "未指定")
+                and isinstance(item.get("replacement"), str)
+                and isinstance(item.get("comment"), str)
+                and bool(item["replacement"].strip() or item["comment"].strip()))
+
+    recent = [item for item in data.get("recent", []) if valid_item(item)][:PHRASE_MEMORY_LIMIT]
+    presets = {}
+    if isinstance(data.get("presets"), dict):
+        for name, items in data["presets"].items():
+            if isinstance(name, str) and name.strip() and isinstance(items, list):
+                presets[name] = [item for item in items if valid_item(item)][:PHRASE_MEMORY_LIMIT]
+    return {"version": PHRASE_MEMORY_VERSION, "recent": recent, "presets": presets}
+
+
+def save_phrase_store(store, path=PHRASE_MEMORY_PATH):
+    """Use an atomic replacement so a power loss cannot leave half a preset."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(store, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def remember_phrase(store, language, replacement, comment, limit=PHRASE_MEMORY_LIMIT):
+    """Move an exact duplicate to the front; each accepted note is one memory."""
+    item = {"language": language, "replacement": replacement.strip(), "comment": comment.strip()}
+    if not item["replacement"] and not item["comment"]:
+        return False
+    recent = [old for old in store["recent"] if old != item]
+    store["recent"] = [item, *recent][:limit]
+    return True
 
 
 def _parse_cues(source):
@@ -146,19 +199,25 @@ class ProofreadingDialog:
         self.output_dir = output_dir or str(Path(source).parent)
         self.dirty = False
         self.current = 0
+        self.selected_range = None
+        self.highlighted_tree_item = None
+        self.phrase_store = load_phrase_store()
         self.window = tk.Toplevel(parent)
         self.window.title("字幕人工校对 — 标记与评论")
-        self.window.geometry(f"{min(1200, parent.winfo_screenwidth()-80)}x{min(800, parent.winfo_screenheight()-100)}")
+        self.window.geometry(f"{min(max(1400, int(parent.winfo_screenwidth()*.92)), parent.winfo_screenwidth()-80)}x{min(max(900, int(parent.winfo_screenheight()*.90)), parent.winfo_screenheight()-100)}")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         # Treeview's default 20px rows do not grow with the app's font/DPI.
         # Use the same CJK font as the GUI and measure its actual pixel height.
         self.review_font = tkfont.nametofont("TkDefaultFont", root=self.window).copy()
-        line_height = self.review_font.metrics("linespace")
+        self.line_height = self.review_font.metrics("linespace")
         style = ttk.Style(self.window)
         self.tree_style = f"Proofreading{id(self)}.Treeview"
         style.configure(self.tree_style, font=self.review_font,
-                        rowheight=line_height + max(10, line_height // 3))
+                        rowheight=self.line_height * 2 + 12)
         style.configure(self.tree_style + ".Heading", font=self.review_font)
+        style.map(self.tree_style,
+                  background=[("selected", "#2f6ea5")],
+                  foreground=[("selected", "#ffffff")])
         toolbar = ttk.Frame(self.window, padding=8)
         toolbar.pack(fill="x")
         for title, command in (("打开校对文件…", self.open), ("保存校对文件…", self.save),
@@ -173,7 +232,7 @@ class ProofreadingDialog:
         pane.add(right, weight=3)
         # Explicitly set the starting split: Text's default 80-character width
         # otherwise determines pane allocation before the window is mapped.
-        self.window.after_idle(lambda: pane.sashpos(0, int(pane.winfo_width() * 0.40))
+        self.window.after_idle(lambda: pane.sashpos(0, int(pane.winfo_width() * 0.55))
                                if pane.winfo_exists() else None)
         search_row = ttk.Frame(left)
         search_row.pack(fill="x")
@@ -182,11 +241,13 @@ class ProofreadingDialog:
         entry.pack(side="left", fill="x", expand=True)
         entry.bind("<Return>", lambda _event: self.populate())
         ttk.Button(search_row, text="搜索", command=self.populate).pack(side="left")
-        self.tree = ttk.Treeview(left, columns=("number", "text"), show="headings", selectmode="browse", style=self.tree_style, height=12)
+        self.tree = ttk.Treeview(left, columns=("number", "timing", "text"), show="headings", selectmode="browse", style=self.tree_style, height=12)
         self.tree.heading("number", text="编号 / 标记数")
+        self.tree.heading("timing", text="开始 / 结束时间")
         self.tree.heading("text", text="字幕内容")
         self.tree.column("number", width=self.review_font.measure("编号 / 标记数") + 24, stretch=False)
-        self.tree.column("text", width=240)
+        self.tree.column("timing", width=self.review_font.measure("00:00:00,000") + 24, stretch=False)
+        self.tree.column("text", width=400, minwidth=240)
         scroll = ttk.Scrollbar(left, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll.set)
         horizontal = ttk.Scrollbar(left, orient="horizontal", command=self.tree.xview)
@@ -195,15 +256,39 @@ class ProofreadingDialog:
         scroll.pack(side="right", fill="y")
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self.select)
+        self.tree.tag_configure("current_cue", background="#cfe8ff", foreground="#111111")
         self.context = tk.StringVar()
         self.context_text = ScrolledText(right, height=4, width=1, wrap="word",
                                         font=self.review_font, state="disabled")
         self.context_text.pack(fill="x", pady=(0, 6))
+        timing_row = ttk.Frame(right)
+        timing_row.pack(fill="x", pady=(0, 5))
+        self.current_timing = tk.StringVar()
+        ttk.Entry(timing_row, textvariable=self.current_timing, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Button(timing_row, text="复制开始时间", command=self.copy_start_time).pack(side="right", padx=(5, 0))
         ttk.Label(right, text="当前字幕：选中错误文字后填写评论").pack(anchor="w")
         self.text = ScrolledText(right, height=7, width=1, wrap="word", exportselection=False,
                                 font=self.review_font, spacing1=3, spacing3=3)
         self.text.pack(fill="both", expand=True)
         self.text.tag_configure("marked", background="#ffe59a", foreground="#151515")
+        self.text.tag_configure("active_selection", background="#2f6ea5", foreground="#ffffff")
+        self.text.bind("<ButtonRelease-1>",
+                       lambda _event: self.window.after_idle(self.capture_selection), add="+")
+        self.text.bind("<KeyRelease>",
+                       lambda _event: self.window.after_idle(self.capture_selection), add="+")
+
+        memory_header = ttk.Frame(right)
+        memory_header.pack(fill="x", pady=(7, 2))
+        ttk.Label(memory_header, text="常用意见（点击即可填入下方）").pack(side="left")
+        self.preset_name = tk.StringVar()
+        self.preset_combo = ttk.Combobox(memory_header, textvariable=self.preset_name,
+                                         state="readonly", width=14)
+        self.preset_combo.pack(side="left", padx=(12, 3))
+        ttk.Button(memory_header, text="加载预设", command=self.load_phrase_preset).pack(side="left", padx=2)
+        ttk.Button(memory_header, text="保存为预设", command=self.save_phrase_preset).pack(side="left", padx=2)
+        self.memory_frame = ttk.Frame(right, height=self.line_height * 3 + 30)
+        self.memory_frame.pack(fill="x")
+        self.memory_frame.pack_propagate(False)
         fields = ttk.Frame(right)
         fields.pack(fill="x", pady=5)
         self.language = tk.StringVar(value="未指定")
@@ -223,6 +308,7 @@ class ProofreadingDialog:
         notes_scroll.pack(fill="x")
         ttk.Button(right, text="删除选中标记", command=self.delete).pack(anchor="e", pady=5)
         self.populate()
+        self.render_phrase_memory()
         self.display()
 
     def populate(self):
@@ -230,11 +316,31 @@ class ProofreadingDialog:
         counts = {}
         for note in self.data["annotations"]:
             counts[note["cue"]] = counts.get(note["cue"], 0) + 1
+        max_lines = 2
         for index, cue in enumerate(self.data["cues"]):
             if self.query.get().casefold() in (cue["text"] + cue["number"] + cue["timing"]).casefold():
-                self.tree.insert("", "end", iid=str(index), values=(f"{cue['number']} / {counts.get(index, 0)}", cue["text"].replace("\n", " / ")))
+                # Preserve original line order and line breaks, including >2 lines.
+                # Treeview has one shared row height; size it for visible results.
+                max_lines = max(max_lines, cue["text"].count("\n") + 1)
+                timing = "\n".join(part.strip() for part in cue["timing"].split("-->", 1))
+                self.tree.insert("", "end", iid=str(index),
+                                 tags=("current_cue",) if index == self.current else (),
+                                 values=(f"{cue['number']} / {counts.get(index, 0)}", timing, cue["text"]))
+        ttk.Style(self.window).configure(self.tree_style, rowheight=self.line_height * max_lines + 12)
         if self.tree.exists(str(self.current)):
             self.tree.selection_set(str(self.current))
+            self.tree.see(str(self.current))
+            self.highlighted_tree_item = str(self.current)
+        else:
+            self.highlighted_tree_item = None
+
+    def copy_start_time(self):
+        """Copy a player-friendly time without changing the source timestamp."""
+        timing = self.data["cues"][self.current]["timing"]
+        start = timing.split("-->", 1)[0].strip().replace(",", ".")
+        self.window.clipboard_clear()
+        self.window.clipboard_append(start)
+        self.status.set(f"已复制开始时间 {start}，可在视频播放器的跳转功能中使用。")
 
     def select(self, _event=None):
         selection = self.tree.selection()
@@ -247,6 +353,7 @@ class ProofreadingDialog:
 
     def display(self):
         cue = self.data["cues"][self.current]
+        self.current_timing.set(cue["timing"])
         before = self.data["cues"][self.current-1]["text"] if self.current else "无"
         after = self.data["cues"][self.current+1]["text"] if self.current+1 < len(self.data["cues"]) else "无"
         self.context.set(f"字幕 {cue['number']} · {cue['timing']}\n前文：{before}\n后文：{after}")
@@ -257,6 +364,14 @@ class ProofreadingDialog:
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("1.0", cue["text"])
+        self.selected_range = None
+        current_item = str(self.current)
+        if (self.highlighted_tree_item and self.highlighted_tree_item != current_item
+                and self.tree.exists(self.highlighted_tree_item)):
+            self.tree.item(self.highlighted_tree_item, tags=())
+        if self.tree.exists(current_item):
+            self.tree.item(current_item, tags=("current_cue",))
+            self.highlighted_tree_item = current_item
         self.notes.delete(0, "end")
         self.note_ids = []
         for index, note in enumerate(self.data["annotations"]):
@@ -272,17 +387,112 @@ class ProofreadingDialog:
                 self.note_ids.append(index)
         self.text.configure(state="disabled")
 
+    def capture_selection(self, _event=None):
+        """Keep the blue highlight visible after focus moves to an input field."""
+        self.text.tag_remove("active_selection", "1.0", "end")
+        try:
+            start_index, end_index = self.text.index("sel.first"), self.text.index("sel.last")
+            start = len(self.text.get("1.0", start_index))
+            end = len(self.text.get("1.0", end_index))
+            if start == end:
+                self.selected_range = None
+                return
+            self.selected_range = (start, end)
+            self.text.tag_add("active_selection", start_index, end_index)
+            self.status.set("已高亮错误文字；填写建议或评论后点击“添加标记与评论”。")
+        except tk.TclError:
+            self.selected_range = None
+
+    def render_phrase_memory(self):
+        """Render a fixed three-by-eight MRU grid without changing pane geometry."""
+        for widget in self.memory_frame.winfo_children():
+            widget.destroy()
+        recent = self.phrase_store["recent"][:PHRASE_MEMORY_LIMIT]
+        if not recent:
+            ttk.Label(self.memory_frame, text="添加第一条评论后，常用意见会显示在这里。",
+                      foreground="#666666").grid(row=0, column=0, sticky="w")
+        else:
+            for index, item in enumerate(recent):
+                full = item["comment"] or ("改为：" + item["replacement"])
+                compact = full.replace("\n", " ").strip()
+                label = compact if len(compact) <= 8 else compact[:7] + "…"
+                button = ttk.Button(self.memory_frame, text=label, width=9,
+                                    command=lambda saved=dict(item): self.use_phrase(saved))
+                button.grid(row=index // 8, column=index % 8, sticky="ew", padx=2, pady=2)
+        for column in range(8):
+            self.memory_frame.columnconfigure(column, weight=1, uniform="phrase")
+        names = sorted(self.phrase_store["presets"], key=str.casefold)
+        self.preset_combo.configure(values=names)
+        if self.preset_name.get() not in names:
+            self.preset_name.set(names[0] if names else "")
+
+    def use_phrase(self, item):
+        """Restore all three opinion fields from one clickable memory chip."""
+        self.language.set(item["language"])
+        self.replacement.set(item["replacement"])
+        self.comment.delete("1.0", "end")
+        self.comment.insert("1.0", item["comment"])
+        self.comment.focus_set()
+        self.status.set("已填入常用意见，可继续修改后再添加标记。")
+
+    def persist_phrase_store(self):
+        try:
+            save_phrase_store(self.phrase_store)
+            return True
+        except OSError as exc:
+            messagebox.showwarning("常用意见未保存", f"字幕标记仍可继续，但常用意见无法保存：\n{exc}",
+                                   parent=self.window)
+            return False
+
+    def save_phrase_preset(self):
+        if not self.phrase_store["recent"]:
+            messagebox.showinfo("没有可保存内容", "请先添加至少一条带建议或评论的标记。", parent=self.window)
+            return
+        name = simpledialog.askstring("保存常用意见预设", "预设名称：", parent=self.window)
+        if not name or not name.strip():
+            return
+        name = name.strip()
+        if name in self.phrase_store["presets"] and not messagebox.askyesno(
+                "覆盖预设", f"预设“{name}”已存在，是否覆盖？", parent=self.window):
+            return
+        self.phrase_store["presets"][name] = [dict(item) for item in self.phrase_store["recent"]]
+        if self.persist_phrase_store():
+            self.preset_name.set(name)
+            self.render_phrase_memory()
+            self.preset_name.set(name)
+            self.status.set(f"已保存常用意见预设“{name}”。")
+
+    def load_phrase_preset(self):
+        name = self.preset_name.get()
+        if not name or name not in self.phrase_store["presets"]:
+            messagebox.showinfo("请选择预设", "当前没有可加载的预设。", parent=self.window)
+            return
+        self.phrase_store["recent"] = [dict(item) for item in self.phrase_store["presets"][name]]
+        self.persist_phrase_store()
+        self.render_phrase_memory()
+        self.preset_name.set(name)
+        self.status.set(f"已加载常用意见预设“{name}”。")
+
     def add(self, refresh=True):
         cue = self.data["cues"][self.current]
-        try:
-            start = len(self.text.get("1.0", "sel.first"))
-            end = min(len(cue["text"]), len(self.text.get("1.0", "sel.last")))
-        except tk.TclError:
-            start, end = 0, len(cue["text"])
+        if self.selected_range:
+            start, end = self.selected_range
+        else:
+            try:
+                start = len(self.text.get("1.0", "sel.first"))
+                end = min(len(cue["text"]), len(self.text.get("1.0", "sel.last")))
+            except tk.TclError:
+                start, end = 0, len(cue["text"])
+        replacement = self.replacement.get()
+        comment = self.comment.get("1.0", "end-1c")
         self.data["annotations"].append(dict(cue=self.current, start=start, end=end,
             quote=cue["text"][start:end], language=self.language.get(),
-            replacement=self.replacement.get(), comment=self.comment.get("1.0", "end-1c")))
+            replacement=replacement, comment=comment))
+        if remember_phrase(self.phrase_store, self.language.get(), replacement, comment):
+            self.persist_phrase_store()
+            self.render_phrase_memory()
         self.dirty = True
+        self.selected_range = None
         self.replacement.set("")
         self.comment.delete("1.0", "end")
         if refresh:
