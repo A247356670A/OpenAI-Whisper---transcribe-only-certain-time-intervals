@@ -1,0 +1,5 @@
+# Optional Qwen ASR Transformers backend. Install into the Python running GUI:
+# python -m pip install -r requirements-qwen.txt
+# Requires existing project dependencies and FFmpeg; no vLLM/FlashAttention needed.
+# Prefer a separate environment to avoid changing a working Whisper installation.
+qwen-asr
